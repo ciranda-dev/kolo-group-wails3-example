@@ -83,6 +83,7 @@ func TestControlRecordRoundTripAndRefusals(t *testing.T) {
 		{Kind: ctlOpen, Epoch: 12, Header: []byte("header")},
 		{Kind: ctlClose, ID: [32]byte{5}, Size: 99},
 		{Kind: ctlDir, Header: []byte("header")},
+		{Kind: ctlLink, Epoch: 40, Value: make([]byte, linkSize)},
 	} {
 		got, err := decodeCtl(c.encode(), 1<<10)
 		if err != nil || got.Kind != c.Kind || got.Key != c.Key || !bytes.Equal(got.Value, c.Value) || got.Epoch != c.Epoch || !bytes.Equal(got.Header, c.Header) || got.ID != c.ID || got.Size != c.Size {
@@ -210,6 +211,7 @@ func FuzzDecodeCtl(f *testing.F) {
 	f.Add((&ctlRecord{Kind: ctlOpen, Epoch: 1, Header: []byte("h")}).encode())
 	f.Add((&ctlRecord{Kind: ctlClose, Size: 3}).encode())
 	f.Add((&ctlRecord{Kind: ctlDir, Header: []byte("h")}).encode())
+	f.Add((&ctlRecord{Kind: ctlLink, Epoch: 9, Value: make([]byte, linkSize)}).encode())
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if c, err := decodeCtl(b, 1<<12); err == nil && !bytes.Equal(c.encode(), b) {
 			t.Fatal("a control record does not encode back to its bytes")

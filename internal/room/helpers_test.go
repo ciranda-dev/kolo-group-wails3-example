@@ -130,6 +130,7 @@ type tnodeOpts struct {
 	limits  Limits
 	allow   func(ed25519.PublicKey, netip.AddrPort) bool // replaces the node's own Allow
 	noServe bool                                         // the test serves no connection: a device that is no member
+	policy  Policy                                       // the policy a created room gets
 }
 
 func newTNode(t testing.TB, o tnodeOpts) *tnode {
@@ -388,7 +389,7 @@ func newGroupPins(t testing.TB, n int, lim Limits, pins []pin.Peer, mod func(*tn
 	first := newTNode(t, fo)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	r, err := first.n.Create(ctx, "test", Policy{})
+	r, err := first.n.Create(ctx, "test", fo.policy)
 	if err != nil {
 		t.Fatal(err)
 	}

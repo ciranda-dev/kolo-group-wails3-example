@@ -57,6 +57,8 @@ type roomLog struct {
 	applied  uint64 // entries of a control log already applied
 	since    time.Time
 	reported bool
+	opened   bool   // a control log that has opened a segment
+	openedTo uint64 // the newest epoch it opened one for
 }
 
 func (l *roomLog) key() logKey { return keyOf(l.owner, l.id) }
@@ -466,7 +468,7 @@ func (r *Room) trimLocked() {
 	var replicas, own []*roomLog
 	for _, l := range r.logs {
 		switch {
-		case l.ctl || !l.complete() || r.dirtyLog(l):
+		case l.ctl || r.isPast(l) || !l.complete() || r.dirtyLog(l):
 		case l.own:
 			own = append(own, l)
 		case l.cursor >= l.size:

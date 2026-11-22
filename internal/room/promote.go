@@ -15,7 +15,6 @@ import (
 	kologossip "github.com/ciranda-dev/kolo-gossip"
 	kolomls "github.com/ciranda-dev/kolo-mls"
 	"github.com/ciranda-dev/kolo-mls/braid"
-	"github.com/ciranda-dev/kolo-mls/settle"
 )
 
 // promotion is the part of a device that joins the admins' braid before the roles name it.
@@ -104,7 +103,7 @@ func (r *Room) Promote(ctx context.Context, device ed25519.PublicKey, role Role)
 	next := *v.roles
 	next.Admins = append(slices.Clone(v.roles.Admins), dev)
 	slices.SortFunc(next.Admins, func(a, b [32]byte) int { return bytes.Compare(a[:], b[:]) })
-	exts, err := settle.GroupExtensions(&next)
+	exts, err := groupExtensions(&next, v.hist)
 	if err != nil {
 		return err
 	}

@@ -1,7 +1,6 @@
 package room
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -101,7 +100,7 @@ func (r *Room) syncOnce() {
 	}
 	r.advance()
 	for _, l := range r.snapshot() {
-		if !l.ctl {
+		if !l.ctl && !r.isPast(l) {
 			r.scanSegment(l)
 		}
 	}
@@ -185,11 +184,21 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 			r.poke()
 		}
 	case ctlOpen:
-		if rec.Epoch < r.joinEpoch || !v.roles.Admin(l.owner[:]) {
+		r.logMu.Lock()
+		l.opened, l.openedTo = true, max(l.openedTo, rec.Epoch)
+		r.logMu.Unlock()
+		switch {
+		case !v.roles.Admin(l.owner[:]):
+			return false
+		case rec.Epoch < r.joinEpoch:
+			r.pastOpen(l, i, rec)
 			return false
 		}
 		return r.addLog(l.owner, rec.Header, false, rec.Epoch)
+	case ctlLink:
+		r.addLink(l, rec)
 	case ctlClose:
+		r.pastClose(l, rec)
 		r.logMu.Lock()
 		if s := r.logs[keyOf(l.owner, rec.ID)]; s != nil && !s.ctl && !s.own {
 			s.closed, s.size = true, rec.Size
@@ -376,7 +385,7 @@ func (l *roomLog) cursorNow(r *Room) uint64 {
 // key of a later epoch.
 func (r *Room) readEntry(l *roomLog, i uint64, b []byte, err error) (wait bool) {
 	fail := func(id MessageID, device []byte, epoch uint64, cause error) bool {
-		r.emit(Event{Kind: Message, ID: id, Device: bytes.Clone(device), Epoch: epoch, Err: fmt.Errorf("%w: entry %d of a segment of device %x: %w", ErrCatchUp, i, l.owner[:4], cause)})
+		r.emit(r.entryError(l, i, id, device, epoch, cause))
 		return false
 	}
 	if err != nil {
@@ -395,6 +404,10 @@ func (r *Room) readEntry(l *roomLog, i uint64, b []byte, err error) (wait bool) 
 	if r.seen.has(id) {
 		return false
 	}
+	// A message of an epoch before the join belongs to History, which holds its key.
+	if epoch < r.joinEpoch {
+		return false
+	}
 	r.kmu.RLock()
 	key, ok := r.keys[epoch]
 	r.kmu.RUnlock()
@@ -402,27 +415,15 @@ func (r *Room) readEntry(l *roomLog, i uint64, b []byte, err error) (wait bool) 
 		if epoch > r.view.Load().epoch {
 			return true
 		}
-		if epoch < r.joinEpoch {
-			return false
-		}
 		return fail(id, st.Device[:], epoch, ErrWrongEpoch)
 	}
-	au := r.authorOf(st.Device)
-	if au == nil {
-		return fail(id, st.Device[:], epoch, kologossip.ErrUnknownAuthor)
-	}
-	if err := verifySealed(st.Device[:], r.gid[:], st.sealed, st.Seq); err != nil {
-		return fail(id, st.Device[:], epoch, err)
-	}
-	c, err := r.openContent(&key, st.sealed, st.Device[:], st.Seq)
+	ev, err := r.openStored(st, &key)
 	if err != nil {
 		return fail(id, st.Device[:], epoch, err)
 	}
 	if !r.seen.add(id) {
 		return false
 	}
-	ev := Event{Kind: Message, ID: id, ReplyTo: c.ReplyTo, Parents: c.Parents, Person: bytes.Clone(au.Person), Device: bytes.Clone(st.Device[:]),
-		Time: time.UnixMilli(c.Time), Body: c.Body, Epoch: epoch}
 	r.release(func() []Event { return r.ord.add(ev, r.n.now()) })
 	return false
 }
@@ -443,7 +444,7 @@ func (r *Room) reportGaps() {
 	var gaps []string
 	r.logMu.Lock()
 	for _, l := range r.logs {
-		if l.ctl || !l.closed || l.complete() {
+		if l.ctl || r.isPast(l) || !l.closed || l.complete() {
 			l.since = time.Time{}
 			continue
 		}
@@ -548,7 +549,7 @@ func (r *Room) loadReceipts() error {
 func (r *Room) catchingUp() bool {
 	for _, l := range r.snapshot() {
 		r.logMu.Lock()
-		behind := !l.ctl && l.cursor < l.view.Len() || l.closed && !l.complete()
+		behind := !l.ctl && !r.isPast(l) && l.cursor < l.view.Len() || l.closed && !l.complete()
 		r.logMu.Unlock()
 		if behind {
 			return true

@@ -266,14 +266,15 @@ const (
 	ctlOpen  byte = 2 // a segment opened, with its log header
 	ctlClose byte = 3 // a segment closed, with its final size
 	ctlDir   byte = 4 // the control log of another admin
+	ctlLink  byte = 5 // the history link of an epoch
 )
 
 // ctlRecord is one entry of an admin's control log.
 type ctlRecord struct {
 	Kind   byte
 	Key    string // ctlPut
-	Value  []byte // ctlPut
-	Epoch  uint64 // ctlOpen
+	Value  []byte // ctlPut, ctlLink
+	Epoch  uint64 // ctlOpen, ctlLink
 	Header []byte // ctlOpen, ctlDir: the signed log header, so a reader opens the replica without asking anyone
 	ID     [32]byte
 	Size   uint64 // ctlClose
@@ -294,6 +295,9 @@ func (c *ctlRecord) encode() []byte {
 		e.PutUvarint(c.Size)
 	case ctlDir:
 		e.PutBytes(c.Header)
+	case ctlLink:
+		e.PutUvarint(c.Epoch)
+		e.PutFixed(c.Value)
 	}
 	return e.Bytes()
 }
@@ -323,6 +327,10 @@ func decodeCtl(b []byte, maxValue int) (*ctlRecord, error) {
 		}
 	case ctlDir:
 		c.Header, err = d.Bytes(maxHeader)
+	case ctlLink:
+		if c.Epoch, err = d.Uvarint(); err == nil {
+			c.Value, err = d.Fixed(linkSize)
+		}
 	default:
 		err = errors.New("unknown kind")
 	}

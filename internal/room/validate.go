@@ -146,7 +146,7 @@ func (r *Room) keyFor(v *view, epoch uint64, device [32]byte, now time.Time) ([k
 	}
 	r.kmu.RLock()
 	defer r.kmu.RUnlock()
-	if k, ok := r.keys[epoch]; ok && epoch < v.epoch && v.author(device) != nil {
+	if k, ok := r.keys[epoch]; ok && epoch < v.epoch && epoch >= r.joinEpoch && v.author(device) != nil {
 		return k, nil
 	}
 	return [keySize]byte{}, ErrWrongEpoch

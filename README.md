@@ -15,7 +15,8 @@ This repository is private and experimental. It builds only inside the Kolo work
 - **Show the app window** with its title and an empty list of rooms.
 - **Take two flags**: `-data` for the data folder and `-headless`, which fails with an error until headless mode is built.
 - **Run a room in `internal/room`** (tested, not yet used by the window): create a room, add, remove and promote members through settled Commits, send messages sealed with a key of the MLS epoch over gossip, and read them in causal order. Admins keep the messages in their own logs, pins mirror them, members serve them to each other, and a device that was offline catches up from them, also after a restart. Only member devices connect, and a removed device reads nothing sent after its removal.
-- **Keep history for new members, read-only members**: planned, none of it is built. [How it works](docs/how-it-works.md) says what is built and what is planned.
+- **Give history to new members** (in `internal/room`): a room keeps all its history by default, or from a chosen epoch, or none, and a new member reads it backward through a chain of keys. This costs forward secrecy of the past, which [Security](docs/security.md) says.
+- **Read-only members**: planned, not built. [How it works](docs/how-it-works.md) says what is built and what is planned.
 
 ## Platforms
 
