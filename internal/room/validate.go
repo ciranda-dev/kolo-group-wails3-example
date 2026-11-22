@@ -78,6 +78,9 @@ func (r *Room) check(m *kologossip.Message) error {
 		if err != nil {
 			return err
 		}
+		if !r.mayPostAt(v, s.Epoch, m.Person, m.Device) {
+			return ErrNotPoster
+		}
 		if err := verifySealed(m.Device, r.gid[:], s, m.Seq); err != nil {
 			return err
 		}
@@ -111,6 +114,17 @@ func (r *Room) check(m *kologossip.Message) error {
 		}
 		if _, err := decodeAdminOffer(m.Body); err != nil {
 			return err
+		}
+		if !r.rate.allow([32]byte(m.Device), now) {
+			return ErrRate
+		}
+		return nil
+	case kindLeave:
+		if len(m.Body) != 1 {
+			return ErrMalformed
+		}
+		if v.author([32]byte(m.Device)) == nil {
+			return ErrNotMember
 		}
 		if !r.rate.allow([32]byte(m.Device), now) {
 			return ErrRate

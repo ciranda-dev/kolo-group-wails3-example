@@ -11,108 +11,46 @@ import (
 	kolocodec "github.com/ciranda-dev/kolo-codec"
 	kologossip "github.com/ciranda-dev/kolo-gossip"
 	kololog "github.com/ciranda-dev/kolo-log"
-	kolomls "github.com/ciranda-dev/kolo-mls"
-	"github.com/ciranda-dev/kolo-mls/settle"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
-	// policyExtension is the GroupContext extension type of the history policy, from the private-use range of RFC 9420
-	// section 17.3 next to the roles extension.
-	policyExtension uint16 = 0xF003
-	policyVersion          = 0
-	linkLabel              = "kolo-group/link/v0"
-	linkSize               = nonceSize + keySize + chacha20poly1305.Overhead
-	pollEvery              = 10 * time.Millisecond
+	linkLabel = "kolo-group/link/v0"
+	linkSize  = nonceSize + keySize + chacha20poly1305.Overhead
+	pollEvery = 10 * time.Millisecond
 )
 
-// histPolicy is the history rule of a room. A settled Commit signs it with the rest of the GroupContext.
+// histPolicy is the history rule of a room: links are written for the epochs after Since, so Since is also the oldest epoch
+// a joiner can reach.
 type histPolicy struct {
 	Rule  HistoryRule
-	Since uint64 // with SinceEpoch
-}
-
-func (p histPolicy) encode() []byte {
-	var e kolocodec.Encoder
-	e.PutUvarint(policyVersion)
-	e.PutUvarint(uint64(p.Rule))
-	e.PutUvarint(p.Since)
-	return e.Bytes()
-}
-
-func (p histPolicy) extension() kolomls.Extension {
-	return kolomls.Extension{Type: policyExtension, Data: p.encode()}
-}
-
-func decodeHistPolicy(b []byte) (histPolicy, error) {
-	d := kolocodec.NewDecoder(b)
-	if v, err := d.Uvarint(); err != nil || v != policyVersion {
-		return histPolicy{}, fmt.Errorf("%w: policy version", ErrMalformed)
-	}
-	rule, err := d.UvarintMax(uint64(NoHistory))
-	if err != nil {
-		return histPolicy{}, fmt.Errorf("%w: policy rule", ErrMalformed)
-	}
-	p := histPolicy{Rule: HistoryRule(rule)}
-	if p.Since, err = d.Uvarint(); err != nil || d.Done() != nil || p.Rule != SinceEpoch && p.Since != 0 {
-		return histPolicy{}, fmt.Errorf("%w: policy epoch", ErrMalformed)
-	}
-	return p, nil
-}
-
-// policyOf reads the history policy of a GroupContext; a room without one keeps all its history.
-func policyOf(exts []kolomls.Extension) (histPolicy, error) {
-	for _, e := range exts {
-		if e.Type == policyExtension {
-			return decodeHistPolicy(e.Data)
-		}
-	}
-	return histPolicy{}, nil
-}
-
-// validate checks the policy a caller gives to Create; the posters and the read link are not built.
-func (p Policy) validate() (histPolicy, error) {
-	switch {
-	case len(p.Posters) != 0 || p.ReadLink:
-		return histPolicy{}, ErrNotImplemented
-	case p.History > NoHistory:
-		return histPolicy{}, errInvalid("history rule %d", p.History)
-	case p.History != SinceEpoch && p.Since != 0:
-		return histPolicy{}, errInvalid("an epoch with a rule that has none")
-	}
-	return histPolicy{Rule: p.History, Since: p.Since}, nil
-}
-
-// groupExtensions are the GroupContext extensions of a room: the roles and the history policy.
-func groupExtensions(roles *settle.Roles, p histPolicy) ([]kolomls.Extension, error) {
-	exts, err := settle.GroupExtensions(roles)
-	if err != nil {
-		return nil, err
-	}
-	return append(exts, p.extension()), nil
+	Since uint64 // with AllHistory and SinceEpoch
 }
 
 // allows reports whether the policy lets a link of epoch e exist: the link that opens the key of e-1. A link is never
 // written for an epoch the policy leaves out, so a new policy is not retroactive.
-func (p histPolicy) allows(e uint64) bool {
-	switch p.Rule {
-	case AllHistory:
-		return e >= 1
-	case SinceEpoch:
-		return e > p.Since
-	}
-	return false
-}
+func (p histPolicy) allows(e uint64) bool { return p.Rule != NoHistory && e > p.Since }
 
 // floor is the oldest epoch a device that joined at epoch join can read.
 func (p histPolicy) floor(join uint64) uint64 {
-	switch p.Rule {
-	case AllHistory:
-		return 0
-	case SinceEpoch:
-		return min(p.Since, join)
+	if p.Rule == NoHistory {
+		return join
 	}
-	return join
+	return min(p.Since, join)
+}
+
+// next returns the rule a Commit of epoch e sets when the room wants a rule: links stop or go on from epoch e+1. A chain that
+// was cut is not joined again, so a rule that opens history reaches back only to the cut.
+func (p histPolicy) next(want histPolicy, e uint64) histPolicy {
+	if want.Rule == NoHistory {
+		return want
+	}
+	cut := p.Since
+	if p.Rule == NoHistory {
+		cut = e
+	}
+	want.Since = max(want.Since, cut)
+	return want
 }
 
 func linkAD(gid []byte, epoch uint64) []byte {
@@ -164,7 +102,7 @@ func (r *Room) writeLink(v *view) error {
 	r.logMu.Lock()
 	admin := r.ctl != nil
 	r.logMu.Unlock()
-	if !admin || !v.hist.allows(v.epoch) {
+	if !admin || !v.pol.hist.allows(v.epoch) {
 		return nil
 	}
 	r.kmu.RLock()
@@ -181,14 +119,22 @@ func (r *Room) writeLink(v *view) error {
 }
 
 // addLink keeps the link of an admin's control log, or reports why it is refused: the policy leaves its epoch out, or
-// its admin had already opened a segment of that epoch or a later one.
+// its admin had already opened a segment of that epoch or a later one. A link of an epoch before the join that the
+// policy of the join leaves out is of no use to this device, and no report: the policy of its epoch may have allowed it.
 func (r *Room) addLink(l *roomLog, rec *ctlRecord) {
 	r.logMu.Lock()
 	late := l.opened && l.openedTo >= rec.Epoch
 	r.logMu.Unlock()
+	pol := r.policyAt(rec.Epoch).hist
+	if rec.Epoch < r.joinEpoch {
+		pol = r.joinHist()
+		if !pol.allows(rec.Epoch) {
+			return
+		}
+	}
 	var cause error
 	switch {
-	case !r.view.Load().hist.allows(rec.Epoch):
+	case !pol.allows(rec.Epoch):
 		cause = errors.New("the room's policy leaves its epoch out")
 	case late:
 		cause = errors.New("written after a segment of its epoch")
@@ -209,7 +155,7 @@ func (r *Room) addLink(l *roomLog, rec *ctlRecord) {
 
 // pastOpen remembers a segment of an epoch before the join that the policy lets this device read.
 func (r *Room) pastOpen(l *roomLog, i uint64, rec *ctlRecord) {
-	if rec.Epoch < r.view.Load().hist.floor(r.joinEpoch) {
+	if rec.Epoch < r.joinHist().floor(r.joinEpoch) {
 		return
 	}
 	hd, err := kololog.DecodeLogHeader(rec.Header)
@@ -236,6 +182,9 @@ func (r *Room) pastClose(l *roomLog, rec *ctlRecord) {
 }
 
 func (r *Room) isPast(l *roomLog) bool { return !l.ctl && l.epoch < r.joinEpoch }
+
+// joinHist is the history rule this device joined under; a later rule does not change what it may read of its past.
+func (r *Room) joinHist() histPolicy { return r.policyAt(r.joinEpoch).hist }
 
 // waitUntil polls cond until it holds, ctx ends or CatchUpWait passes, and reports whether it holds.
 func (r *Room) waitUntil(ctx context.Context, cond func() bool) bool {
@@ -322,7 +271,7 @@ func (r *Room) History(ctx context.Context, before MessageID, n int) ([]Event, e
 	case before != r.hlast:
 		return nil, errInvalid("before is not the oldest message of the last page")
 	}
-	floor := r.view.Load().hist.floor(r.joinEpoch)
+	floor := r.joinHist().floor(r.joinEpoch)
 	if r.hbound > floor {
 		r.waitUntil(ctx, r.controlRead)
 	}
@@ -424,7 +373,7 @@ func (r *Room) readPast(ctx context.Context, l *roomLog, i, e uint64) (Event, er
 	}
 	id := messageID(r.gid[:], st.Device[:], st.Seq, st.Body)
 	epoch := st.sealed.Epoch
-	if epoch > e || epoch < r.view.Load().hist.floor(r.joinEpoch) {
+	if epoch > e || epoch < r.joinHist().floor(r.joinEpoch) {
 		err = ErrWrongEpoch
 	} else if err = r.deriveBack(ctx, epoch); err == nil {
 		r.kmu.RLock()
@@ -486,6 +435,9 @@ func (r *Room) openStored(st *stored, key *[keySize]byte) (Event, error) {
 	}
 	if err := verifySealed(st.Device[:], r.gid[:], st.sealed, st.Seq); err != nil {
 		return Event{}, err
+	}
+	if !r.mayPostAt(r.view.Load(), st.sealed.Epoch, au.Person, st.Device[:]) {
+		return Event{}, ErrNotPoster
 	}
 	c, err := r.openContent(key, st.sealed, st.Device[:], st.Seq)
 	if err != nil {

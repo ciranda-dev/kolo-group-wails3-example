@@ -38,6 +38,7 @@ type Node struct {
 	conns   map[[32]byte][]koloswarm.Conn
 	links   map[*connState]struct{}
 	members atomic.Pointer[map[[32]byte]struct{}]
+	open    atomic.Bool // a room has a read link or is one: any device is admitted
 	closed  bool
 }
 
@@ -76,7 +77,7 @@ func Open(ctx context.Context, cfg *Config) (*Node, error) {
 		if len(owner) != ed25519.PublicKeySize || len(peer) != ed25519.PublicKeySize {
 			return kolosync.NoAccess
 		}
-		if r, ok := n.logRoom.Load(keyOf([32]byte(owner), id)); ok && r.(*Room).view.Load().author([32]byte(peer)) != nil {
+		if r, ok := n.logRoom.Load(keyOf([32]byte(owner), id)); ok && r.(*Room).readableBy([32]byte(peer)) {
 			return kolosync.Ciphertext
 		}
 		return kolosync.NoAccess
@@ -150,11 +151,17 @@ func (n *Node) isMember(key []byte) bool {
 		return false
 	}
 	_, ok := (*n.members.Load())[[32]byte(key)]
-	return ok
+	return ok || n.open.Load()
+}
+
+// readableBy reports whether a device may read the room's logs: a member, or anyone when the room has a read link.
+func (r *Room) readableBy(dev [32]byte) bool {
+	v := r.view.Load()
+	return r.reader || v.pol.link || v.author(dev) != nil
 }
 
 // Allow is the admission rule for koloswarm.Config.Allow: only devices that are leaves of a room of this node, and
-// that gossip has not graylisted.
+// that gossip has not graylisted. A node that has a room with a read link, or reads one, admits any device.
 func (n *Node) Allow(key ed25519.PublicKey, addr netip.AddrPort) bool {
 	return n.isMember(key) && n.cfg.Gossip.Allow(key, addr)
 }
@@ -207,7 +214,7 @@ func (n *Node) attachAll() {
 			continue
 		}
 		for _, r := range n.rooms {
-			if r.removed.Load() || r.view.Load().author(cs.key) == nil {
+			if r.removed.Load() || !r.reader && r.view.Load().author(cs.key) == nil {
 				continue
 			}
 			if !cs.synced[r] {
@@ -238,26 +245,40 @@ func (n *Node) syncConn(key ed25519.PublicKey) kolosync.Conn {
 func (n *Node) refreshMembers() {
 	n.mu.Lock()
 	set := map[[32]byte]struct{}{}
+	open := false
 	for _, r := range n.rooms {
 		if r.removed.Load() {
 			continue
 		}
 		if v := r.view.Load(); v != nil {
+			open = open || r.reader || v.pol.link
 			for d := range v.authors {
 				set[d] = struct{}{}
 			}
 		}
 	}
 	n.members.Store(&set)
+	n.open.Store(open)
 	for k, cs := range n.conns {
-		if _, ok := set[k]; !ok {
+		if _, ok := set[k]; !ok && !open {
 			for _, c := range cs {
-				c.CloseWithError(0, "room: no longer a member device")
+				n.closeLater(k, c)
 			}
 		}
 	}
 	n.mu.Unlock()
 	n.attachAll()
+}
+
+// closeLater closes the connection of a device that is no member any more after PastEpoch: the Commit that removed it is on
+// its way over the connection, and a device that never receives it never learns that it was removed. The device is refused
+// at once for any new connection.
+func (n *Node) closeLater(k [32]byte, c koloswarm.Conn) {
+	time.AfterFunc(n.limits.PastEpoch, func() {
+		if !n.isMember(k[:]) {
+			c.CloseWithError(0, "room: no longer a member device")
+		}
+	})
 }
 
 func (n *Node) mlsConfig() kolomls.Config {
@@ -279,10 +300,10 @@ func (n *Node) KeyPackage() ([]byte, error) {
 	return kolomls.NewKeyPackage(n.cfg.MLSStore, kolomls.KeyPackageOptions{Credential: c, SignatureKey: sig, Capabilities: caps})
 }
 
-// Create makes a room with this device as its first member, admin and settler. The history rule of p is recorded in the
-// room's GroupContext; the posters and the read link are not built.
+// Create makes a room with this device as its first member, admin and settler. The policy p is recorded in the room's
+// GroupContext.
 func (n *Node) Create(ctx context.Context, name string, p Policy) (*Room, error) {
-	hp, err := p.validate()
+	hp, err := p.build(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -334,6 +355,11 @@ func (n *Node) Create(ctx context.Context, name string, p Policy) (*Room, error)
 		r.kv.dropAll()
 		return fail(err)
 	}
+	if err := r.writeRead(r.view.Load()); err != nil {
+		r.Close()
+		r.kv.dropAll()
+		return fail(err)
+	}
 	return r, nil
 }
 
@@ -359,11 +385,6 @@ func (n *Node) Join(ctx context.Context, welcome []byte) (*Room, error) {
 		return nil, err
 	}
 	return r, nil
-}
-
-// JoinLink enters a room that has a read link; the device only reads.
-func (n *Node) JoinLink(ctx context.Context, link []byte) (*Room, error) {
-	return nil, ErrNotImplemented
 }
 
 // Room returns the room with the given id.

@@ -311,6 +311,8 @@ func FuzzCheck(f *testing.F) {
 	f.Add(good)
 	f.Add((&commitMsg{Settled: (&settle.Settled{TBS: settle.TBS{GroupID: r.gid[:], Epoch: v.epoch}}).Encode(), Commit: []byte{1}}).encode())
 	f.Add([]byte{kindCommit, 0xff, 0xff})
+	f.Add([]byte{kindLeave})
+	f.Add([]byte{kindLeave, 1})
 	f.Fuzz(func(t *testing.T, body []byte) {
 		r.check(&kologossip.Message{Person: a.person.PublicKey(), Device: a.key(), Seq: 1, Time: time.Now(), Body: body})
 	})

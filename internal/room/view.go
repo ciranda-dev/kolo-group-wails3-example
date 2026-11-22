@@ -18,7 +18,7 @@ type view struct {
 	authors map[[32]byte]*kologossip.Author
 	members []Member
 	roles   *settle.Roles
-	hist    histPolicy
+	pol     *roomPolicy
 	// prev is the epoch before, kept until prevUntil so messages in flight still pass.
 	prev      *view
 	prevUntil time.Time
@@ -30,7 +30,7 @@ func newView(m *settle.Member, old *view, now time.Time, window time.Duration) (
 	if err != nil {
 		return nil, err
 	}
-	hist, err := policyOf(m.Extensions())
+	pol, err := policyOf(m.Extensions())
 	if err != nil {
 		return nil, err
 	}
@@ -38,7 +38,7 @@ func newView(m *settle.Member, old *view, now time.Time, window time.Duration) (
 	if err != nil {
 		return nil, err
 	}
-	v := &view{epoch: m.Epoch(), key: key, roles: roles, hist: hist, authors: map[[32]byte]*kologossip.Author{}}
+	v := &view{epoch: m.Epoch(), key: key, roles: roles, pol: pol, authors: map[[32]byte]*kologossip.Author{}}
 	t := m.Tree()
 	for _, l := range t.Members() {
 		c, err := cred.Decode(t.Leaf(l).Credential)
@@ -51,21 +51,30 @@ func newView(m *settle.Member, old *view, now time.Time, window time.Duration) (
 			a = &kologossip.Author{Person: c.Person(), Cert: c.Cert}
 		}
 		v.authors[dev] = a
-		role := Role(0)
-		switch {
-		case roles.Settler(dev[:]):
-			role = Settler
-		case roles.Admin(dev[:]):
-			role = Admin
-		}
-		v.members = append(v.members, Member{Person: bytes.Clone(c.Person()), Device: bytes.Clone(c.Device()), Role: role})
+		v.members = append(v.members, Member{Person: bytes.Clone(c.Person()), Device: bytes.Clone(c.Device()), Role: roleOf(roles, dev[:])})
 	}
+	v.keepPrev(old, now, window)
+	return v, nil
+}
+
+// keepPrev holds the view before this one for the window, so messages in flight still pass.
+func (v *view) keepPrev(old *view, now time.Time, window time.Duration) {
 	if old != nil {
 		p := *old
 		p.prev = nil
 		v.prev, v.prevUntil = &p, now.Add(window)
 	}
-	return v, nil
+}
+
+// roleOf returns the role of a device under roles.
+func roleOf(roles *settle.Roles, dev []byte) Role {
+	switch {
+	case roles.Settler(dev):
+		return Settler
+	case roles.Admin(dev):
+		return Admin
+	}
+	return 0
 }
 
 func (v *view) author(dev [32]byte) *kologossip.Author {

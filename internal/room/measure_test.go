@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -229,4 +230,55 @@ func TestMeasureLinks(t *testing.T) {
 		}
 		t.Logf("walk of %d links on Pebble: %v (%v each), %d B of memory for the links held, %d B each", n, d.Round(time.Millisecond), (d / time.Duration(n)).Round(time.Microsecond), held, held/int64(n))
 	}
+}
+
+// TestMeasureReaders measures what the policy, a read link and the state of an epoch cost, for the limits and the docs. It
+// runs with KOLO_GROUP_MEASURE=1.
+func TestMeasureReaders(t *testing.T) {
+	if os.Getenv("KOLO_GROUP_MEASURE") == "" {
+		t.Skip("measurement: set KOLO_GROUP_MEASURE=1")
+	}
+	for _, n := range []int{1, 3, 100, 10000} {
+		p := &roomPolicy{link: true}
+		for i := range n {
+			var k [32]byte
+			binary.BigEndian.PutUint32(k[:], uint32(i))
+			p.persons = append(p.persons, k)
+		}
+		start := time.Now()
+		b := p.encode()
+		if _, err := decodeRoomPolicy(b); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("a policy of %d posters and a read link: %d B, encoded and decoded in %v", n, len(b), time.Since(start))
+	}
+	gr, _ := newLinkGroup(t, 2)
+	admin := gr.rooms[0]
+	v := admin.view.Load()
+	st := readStateOf(v)
+	rk, err := readKeyOf(&v.pol.secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := sealRead(admin.gid[:], v.epoch, &rk, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, err := admin.Link()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("the state of an epoch with %d authors (the admin, which is the one poster): %d B sealed, %d B of it the certificate and person of each; a link %d B", len(st.Authors), len(rec), len(st.Authors[0]), len(link))
+	const epochs = 1000
+	start := time.Now()
+	for range epochs {
+		s, err := openRead(admin.gid[:], v.epoch, &rk, rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readerView(s, v.epoch, nil, time.Now(), time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("a reader opens and installs the state of an epoch in %v", (time.Since(start) / epochs).Round(time.Microsecond))
 }
