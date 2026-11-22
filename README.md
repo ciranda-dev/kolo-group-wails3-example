@@ -12,9 +12,10 @@ This repository is private and experimental. It builds only inside the Kolo work
 
 ## What it does
 
-- **Show the app window** with its title and an empty list of rooms. This is all that is built.
+- **Show the app window** with its title and an empty list of rooms.
 - **Take two flags**: `-data` for the data folder and `-headless`, which fails with an error until headless mode is built.
-- **Create and join rooms, send messages, keep history, read-only members**: planned, none of it is built. [How it works](docs/how-it-works.md) says what is planned.
+- **Run a live room in `internal/room`** (tested, not yet used by the window): create a room, add and remove members through settled Commits, send messages sealed with a key of the MLS epoch over gossip, and read them in causal order. Only member devices connect, and a removed device reads nothing sent after its removal.
+- **Keep history, catch up after being offline, read-only members**: planned, none of it is built. [How it works](docs/how-it-works.md) says what is built and what is planned.
 
 ## Platforms
 
@@ -41,14 +42,16 @@ go build -tags production -o bin/kolo-group .
 
 ## How it uses Kolo
 
-The libraries below are the direct requirements of `go.mod`. `internal/room` names their types in its `Config`, and no code calls them yet.
+The libraries below are the direct requirements of `go.mod`. `internal/room` uses them; the window does not call it yet.
 
 | Kolo library | What the app will use it for |
 |---|---|
 | [kolo-mls](https://github.com/ciranda-dev/kolo-mls) | end-to-end encryption of each room by MLS (RFC 9420) |
 | [kolo-gossip](https://github.com/ciranda-dev/kolo-gossip) | live delivery of signed messages to the members online |
+| [kolo-braid](https://github.com/ciranda-dev/kolo-braid) | the admins' order of the changes of a room |
+| [kolo-sync](https://github.com/ciranda-dev/kolo-sync) | replication of logs on the bidirectional streams of a connection (no log is offered yet) |
 | [kolo-swarm](https://github.com/ciranda-dev/kolo-swarm) | connections between devices |
-| [kolo-pin](https://github.com/ciranda-dev/kolo-pin) | copies of the room's logs for people who are offline |
+| [kolo-pin](https://github.com/ciranda-dev/kolo-pin) | copies of the room's logs for people who are offline (planned, not used yet) |
 | [kolo-store](https://github.com/ciranda-dev/kolo-store) | the app's local storage |
 | [kolo-id](https://github.com/ciranda-dev/kolo-id) | the identity and device certificate of each person |
 
@@ -58,7 +61,7 @@ The libraries below are the direct requirements of `go.mod`. `internal/room` nam
 main.go, config.go         the window and the flags
 groupservice.go            the Wails service the window calls
 headless.go                the -headless stub
-internal/room/             the room API, signatures only
+internal/room/             the room: Node, Room, sealing, order, admission
 frontend/                  the window (Vite)
 build/, scripts/           icons, installers and release scripts
 docs/                      how it works, security, limits, build and test
