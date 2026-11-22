@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Kolo Group
+Comment=Desktop group chat built with Kolo
+Exec=kolo-group %u
+Icon=kolo-group
+Terminal=false
+Categories=Network;Chat;
+StartupWMClass=kolo-group
