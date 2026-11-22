@@ -1,12 +1,14 @@
 package room
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
 	"time"
 
 	kologossip "github.com/ciranda-dev/kolo-gossip"
+	kololog "github.com/ciranda-dev/kolo-log"
 	"github.com/ciranda-dev/kolo-mls/settle"
 )
 
@@ -72,14 +74,17 @@ func (r *Room) check(m *kologossip.Message) error {
 		if err != nil {
 			return err
 		}
-		ev := v.at(s.Epoch, now)
-		if ev == nil || ev.author([32]byte(m.Device)) == nil {
-			return ErrWrongEpoch
+		key, err := r.keyFor(v, s.Epoch, [32]byte(m.Device), now)
+		if err != nil {
+			return err
+		}
+		if err := verifySealed(m.Device, r.gid[:], s, m.Seq); err != nil {
+			return err
 		}
 		if !r.rate.allow([32]byte(m.Device), now) {
 			return ErrRate
 		}
-		_, err = r.openMessage(&ev.key, s, m)
+		_, err = r.openMessage(&key, s, m)
 		return err
 	case kindCommit:
 		c, err := decodeCommit(m.Body)
@@ -100,13 +105,69 @@ func (r *Room) check(m *kologossip.Message) error {
 			return ErrRate
 		}
 		return nil
+	case kindPromote, kindAdminWelcome:
+		if !v.roles.Admin(m.Device) {
+			return ErrNotAdmin
+		}
+		if _, err := decodeAdminOffer(m.Body); err != nil {
+			return err
+		}
+		if !r.rate.allow([32]byte(m.Device), now) {
+			return ErrRate
+		}
+		return nil
+	case kindAdminRequest:
+		q, err := decodeAdminRequest(m.Body)
+		if err != nil {
+			return err
+		}
+		if hd, err := kololog.DecodeLogHeader(q.Header); err != nil || !bytes.Equal(hd.LogKey, m.Device) {
+			return ErrMalformed
+		}
+		if v.author([32]byte(m.Device)) == nil {
+			return ErrWrongEpoch
+		}
+		if !r.rate.allow([32]byte(m.Device), now) {
+			return ErrRate
+		}
+		return nil
 	}
 	return ErrMalformed
 }
 
-// openMessage opens a sealed message under key and checks what it holds.
+// keyFor returns the key a message of epoch is sealed under: the current epoch's, the previous one's while its window
+// lasts and, for a device that is a member of it, any older one the room holds, which a message published again needs.
+func (r *Room) keyFor(v *view, epoch uint64, device [32]byte, now time.Time) ([keySize]byte, error) {
+	if ev := v.at(epoch, now); ev != nil {
+		if ev.author(device) == nil {
+			return [keySize]byte{}, ErrWrongEpoch
+		}
+		return ev.key, nil
+	}
+	r.kmu.RLock()
+	defer r.kmu.RUnlock()
+	if k, ok := r.keys[epoch]; ok && epoch < v.epoch && v.author(device) != nil {
+		return k, nil
+	}
+	return [keySize]byte{}, ErrWrongEpoch
+}
+
+// openMessage opens a sealed message under key and checks what it holds against its envelope.
 func (r *Room) openMessage(key *[keySize]byte, s *sealed, m *kologossip.Message) (*content, error) {
-	pt, err := open(key, s.Nonce, aad(r.gid[:], s.Epoch, m.Device, m.Seq), s.CT)
+	c, err := r.openContent(key, s, m.Device, m.Seq)
+	if err != nil {
+		return nil, err
+	}
+	if c.Time-m.Time.UnixMilli() > r.n.limits.MaxSkew.Milliseconds() {
+		return nil, ErrBadTime
+	}
+	return c, nil
+}
+
+// openContent opens a sealed message and checks what it holds. A message published again is older than its envelope, so
+// only a time ahead of the envelope's is refused.
+func (r *Room) openContent(key *[keySize]byte, s *sealed, device []byte, seq uint64) (*content, error) {
+	pt, err := open(key, s.Nonce, aad(r.gid[:], s.Epoch, device, seq), s.CT)
 	if err != nil {
 		return nil, err
 	}
@@ -116,9 +177,6 @@ func (r *Room) openMessage(key *[keySize]byte, s *sealed, m *kologossip.Message)
 	}
 	if len(c.Parents) > r.n.limits.MaxParents {
 		return nil, ErrTooManyParents
-	}
-	if d := time.UnixMilli(c.Time).Sub(m.Time); d > r.n.limits.MaxSkew || -d > r.n.limits.MaxSkew {
-		return nil, ErrBadTime
 	}
 	return c, nil
 }

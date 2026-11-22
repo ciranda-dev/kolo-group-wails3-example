@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +17,8 @@ import (
 	kolodht "github.com/ciranda-dev/kolo-dht"
 	kologossip "github.com/ciranda-dev/kolo-gossip"
 	koloid "github.com/ciranda-dev/kolo-id"
+	kololog "github.com/ciranda-dev/kolo-log"
+	"github.com/ciranda-dev/kolo-pin"
 	kolosecure "github.com/ciranda-dev/kolo-secure"
 	kolostore "github.com/ciranda-dev/kolo-store"
 	koloswarm "github.com/ciranda-dev/kolo-swarm"
@@ -87,6 +91,11 @@ type tnode struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	opts    tnodeOpts
+	mls     kolostore.Backend // what a restart keeps: the MLS state, the room's state and the logs
+	backend kolostore.Backend
+	store   *kolostore.Store
+
 	askedMu sync.Mutex
 	asked   map[[32]byte]bool
 	served  map[[32]byte]error // the last ServeConn result per remote key
@@ -116,6 +125,8 @@ func (tn *tnode) wasAsked(key ed25519.PublicKey) bool {
 type tnodeOpts struct {
 	server  *kolodht.Node
 	person  *koloid.Identity
+	pins    []pin.Peer
+	dir     string // keeps the device's state in Pebble stores under this directory instead of in memory
 	limits  Limits
 	allow   func(ed25519.PublicKey, netip.AddrPort) bool // replaces the node's own Allow
 	noServe bool                                         // the test serves no connection: a device that is no member
@@ -123,7 +134,7 @@ type tnodeOpts struct {
 
 func newTNode(t testing.TB, o tnodeOpts) *tnode {
 	t.Helper()
-	tn := &tnode{t: t, person: o.person, dev: ident(t), asked: map[[32]byte]bool{}, served: map[[32]byte]error{}, conns: map[[32]byte]koloswarm.Conn{}}
+	tn := &tnode{t: t, opts: o, person: o.person, dev: ident(t), mls: kolostore.NewMemory(), backend: kolostore.NewMemory(), store: kolostore.New(kolostore.NewMemory())}
 	if tn.person == nil {
 		tn.person = ident(t)
 	}
@@ -134,6 +145,26 @@ func newTNode(t testing.TB, o tnodeOpts) *tnode {
 	if tn.cert, err = tn.dev.AcceptDeviceCert(offer, tn.person.PublicKey()); err != nil {
 		t.Fatal(err)
 	}
+	tn.start()
+	t.Cleanup(tn.close)
+	return tn
+}
+
+// start runs the swarm, gossip and room node of the device over the state it keeps, which is empty for a new device and
+// what the last run left after a restart.
+func (tn *tnode) start() {
+	t, o := tn.t, tn.opts
+	if o.dir != "" {
+		open := func(name string) kolostore.Backend {
+			b, err := kolostore.OpenPebble(filepath.Join(o.dir, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return b
+		}
+		tn.mls, tn.backend, tn.store = open("mls"), open("state"), kolostore.New(open("logs"))
+	}
+	tn.asked, tn.served, tn.conns = map[[32]byte]bool{}, map[[32]byte]error{}, map[[32]byte]koloswarm.Conn{}
 	sw, err := koloswarm.New(context.Background(), "127.0.0.1:0", tn.dev, &koloswarm.Config{
 		DHT: &kolodht.Config{
 			RequestTimeout: 300 * time.Millisecond,
@@ -172,9 +203,9 @@ func newTNode(t testing.TB, o tnodeOpts) *tnode {
 	if tn.g, err = kologossip.New(tn.dev, &kologossip.Config{Cert: tn.cert, Swarm: sw, HeartbeatInterval: 100 * time.Millisecond}); err != nil {
 		t.Fatal(err)
 	}
-	mls := kolostore.NewMemory()
-	tn.n, err = Open(context.Background(), &Config{Device: tn.dev, Cert: tn.cert, Swarm: sw, Gossip: tn.g, MLSStore: backendstore.New(mls, []byte("mls/")),
-		Backend: kolostore.NewMemory(), BraidLimits: braidLimits(), Limits: o.limits})
+	tn.np.Store(nil)
+	tn.n, err = Open(context.Background(), &Config{Device: tn.dev, Cert: tn.cert, Swarm: sw, Gossip: tn.g, MLSStore: backendstore.New(tn.mls, []byte("mls/")),
+		Backend: tn.backend, Store: tn.store, Pins: o.pins, BraidLimits: braidLimits(), Limits: o.limits})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,34 +235,62 @@ func newTNode(t testing.TB, o tnodeOpts) *tnode {
 			})
 		}
 	})
-	t.Cleanup(tn.close)
-	return tn
 }
 
-func (tn *tnode) close() {
+// restart stops the device and starts it again over the state it kept, as a process that was killed and run again.
+func (tn *tnode) restart() {
+	tn.stop()
+	tn.start()
+}
+
+// stop ends the device and keeps its state.
+func (tn *tnode) stop() {
 	tn.n.Close()
 	tn.cancel()
 	tn.g.Close()
 	tn.sw.Close()
 	tn.wg.Wait()
+	if tn.opts.dir != "" {
+		tn.store.Close()
+		tn.mls.Close()
+		tn.backend.Close()
+	}
+}
+
+func (tn *tnode) close() {
+	tn.stop()
+	tn.store.Close()
 }
 
 func (tn *tnode) key() ed25519.PublicKey { return tn.dev.PublicKey() }
 
-// recorder collects what a room delivers.
+// recorder collects what a room delivers. A light recorder keeps the events with an error and counts the messages.
 type recorder struct {
-	r  *Room
-	mu sync.Mutex
-	ev []Event
+	r     *Room
+	light bool
+	count atomic.Int64
+	mu    sync.Mutex
+	ev    []Event
 }
 
-func record(t testing.TB, r *Room) *recorder {
-	rec := &recorder{r: r}
+func record(t testing.TB, r *Room) *recorder { return recordWith(r, false) }
+
+func recordWith(r *Room, light bool) *recorder {
+	rec := &recorder{r: r, light: light}
 	go func() {
 		for {
 			ev, err := r.Next(context.Background())
 			if err != nil {
 				return
+			}
+			if light {
+				if ev.Err == nil && ev.Kind == Message {
+					rec.count.Add(1)
+					continue
+				}
+				if ev.Err == nil {
+					continue
+				}
 			}
 			rec.mu.Lock()
 			rec.ev = append(rec.ev, ev)
@@ -239,6 +298,19 @@ func record(t testing.TB, r *Room) *recorder {
 		}
 	}()
 	return rec
+}
+
+// bodies set returns the distinct bodies of the messages shown without an error.
+func (rec *recorder) bodySet() map[string]struct{} {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	out := map[string]struct{}{}
+	for _, ev := range rec.ev {
+		if ev.Kind == Message && ev.Err == nil {
+			out[string(ev.Body)] = struct{}{}
+		}
+	}
+	return out
 }
 
 func (rec *recorder) events() []Event {
@@ -284,6 +356,11 @@ type group struct {
 	nodes  []*tnode
 	rooms  []*Room
 	recs   []*recorder
+	away   map[int]bool // members that are stopped; the waits skip them
+	light  bool         // the recorders of members that join count messages and keep nothing else
+	keep   map[int]bool // members whose recorders keep every event even then
+	lim    Limits
+	pins   []pin.Peer
 }
 
 // newGroup creates a room on a new node and adds n-1 more nodes to it, one Add per node, and waits until every
@@ -296,9 +373,15 @@ func newGroup(t testing.TB, n int, lim Limits) *group {
 // newGroupWith is newGroup with mod applied to the options of the first node.
 func newGroupWith(t testing.TB, n int, lim Limits, mod func(*tnodeOpts)) *group {
 	t.Helper()
+	return newGroupPins(t, n, lim, nil, mod)
+}
+
+// newGroupPins is newGroupWith for devices that use the given pins.
+func newGroupPins(t testing.TB, n int, lim Limits, pins []pin.Peer, mod func(*tnodeOpts)) *group {
+	t.Helper()
 	server := newServer(t)
-	gr := &group{t: t, server: server}
-	fo := tnodeOpts{server: server, limits: lim}
+	gr := &group{t: t, server: server, lim: lim, pins: pins}
+	fo := tnodeOpts{server: server, limits: lim, pins: pins}
 	if mod != nil {
 		mod(&fo)
 	}
@@ -311,10 +394,14 @@ func newGroupWith(t testing.TB, n int, lim Limits, mod func(*tnodeOpts)) *group 
 	}
 	gr.nodes, gr.rooms, gr.recs = []*tnode{first}, []*Room{r}, []*recorder{record(t, r)}
 	for i := 1; i < n; i++ {
-		nd := newTNode(t, tnodeOpts{server: server, limits: lim})
-		gr.join(ctx, nd)
+		gr.join(ctx, gr.newNode())
 	}
 	return gr
+}
+
+// newNode makes a device that can join the group: it uses the group's server, limits and pins.
+func (gr *group) newNode() *tnode {
+	return newTNode(gr.t, tnodeOpts{server: gr.server, limits: gr.lim, pins: gr.pins})
 }
 
 // join adds nd to the room with an Add by the first node and waits for every member to reach the new epoch.
@@ -332,7 +419,7 @@ func (gr *group) join(ctx context.Context, nd *tnode) {
 	if err != nil {
 		gr.t.Fatal(err)
 	}
-	gr.nodes, gr.rooms, gr.recs = append(gr.nodes, nd), append(gr.rooms, r), append(gr.recs, record(gr.t, r))
+	gr.nodes, gr.rooms, gr.recs = append(gr.nodes, nd), append(gr.rooms, r), append(gr.recs, recordWith(r, gr.light))
 	gr.waitEpoch(gr.rooms[0].Status().Epoch)
 }
 
@@ -367,7 +454,7 @@ func (gr *group) joinBatch(ctx context.Context, nds []*tnode) {
 		if err != nil {
 			gr.t.Fatal(err)
 		}
-		gr.nodes, gr.rooms, gr.recs = append(gr.nodes, nd), append(gr.rooms, r), append(gr.recs, record(gr.t, r))
+		gr.nodes, gr.rooms, gr.recs = append(gr.nodes, nd), append(gr.rooms, r), append(gr.recs, recordWith(r, gr.light))
 	}
 	gr.waitEpoch(gr.rooms[0].Status().Epoch)
 }
@@ -375,8 +462,8 @@ func (gr *group) joinBatch(ctx context.Context, nds []*tnode) {
 func (gr *group) waitEpoch(e uint64) {
 	gr.t.Helper()
 	waitFor(gr.t, 60*time.Second, fmt.Sprintf("every member at epoch %d", e), func() bool {
-		for _, r := range gr.rooms {
-			if !r.removed.Load() && r.Status().Epoch != e {
+		for i, r := range gr.rooms {
+			if !gr.away[i] && !r.removed.Load() && r.Status().Epoch != e {
 				return false
 			}
 		}
@@ -389,8 +476,106 @@ func (gr *group) waitEpoch(e uint64) {
 func (gr *group) waitMesh(min int) {
 	gr.t.Helper()
 	waitFor(gr.t, 60*time.Second, "the gossip mesh", func() bool {
-		for _, r := range gr.rooms {
-			if !r.removed.Load() && r.gr.Stats().Mesh < min {
+		for i, r := range gr.rooms {
+			if !gr.away[i] && !r.removed.Load() && r.gr.Stats().Mesh < min {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// restart stops member i and starts it again over its stored state, and returns its reopened room.
+func (gr *group) restart(i int) *Room {
+	gr.t.Helper()
+	gr.nodes[i].restart()
+	delete(gr.away, i)
+	rooms := gr.nodes[i].n.Rooms()
+	if len(rooms) != 1 {
+		gr.t.Fatalf("member %d reopened %d rooms", i, len(rooms))
+	}
+	gr.rooms[i], gr.recs[i] = rooms[0], recordWith(rooms[0], gr.light && !gr.keep[i])
+	return rooms[0]
+}
+
+// stop ends member i and keeps its state.
+func (gr *group) stop(i int) {
+	if gr.away == nil {
+		gr.away = map[int]bool{}
+	}
+	gr.away[i] = true
+	gr.nodes[i].stop()
+}
+
+// pinServer is a pinning peer on 127.0.0.1 with its data in a temporary directory.
+type pinServer struct {
+	peer pin.Peer
+	stop context.CancelFunc
+	done chan error
+}
+
+func newPin(t testing.TB) *pinServer {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "pin")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// pin.Serve loads the identity of its directory, so the listener must use that one.
+	id, err := pin.LoadIdentity(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := kolosecure.Listen(context.Background(), "127.0.0.1:0", id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ps := &pinServer{peer: pin.Peer{ID: id.PublicKey(), Addr: ln.Addr().String()}, stop: cancel, done: make(chan error, 1)}
+	go func() { ps.done <- pin.Serve(ctx, ln, pin.Options{Dir: dir}) }()
+	t.Cleanup(func() { ps.down() })
+	return ps
+}
+
+// down stops the pinning peer.
+func (ps *pinServer) down() {
+	ps.stop()
+	select {
+	case <-ps.done:
+	case <-time.After(10 * time.Second):
+	}
+}
+
+// pinsHold waits until every pin holds at least entries entries of the log of owner.
+func pinsHold(t testing.TB, peers []pin.Peer, owner *koloid.Identity, logID kololog.LogID, entries uint64) {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		last := ""
+		for i, p := range peers {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			info, err := pin.Status(ctx, owner, p, logID)
+			cancel()
+			if err != nil || info.Entries < entries {
+				last = fmt.Sprintf("pin %d holds %d of %d entries of log %x: %v", i, info.Entries, entries, logID[:3], err)
+				break
+			}
+		}
+		if last == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(last)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// waitPeers waits until every running member is connected to at least n gossip peers.
+func (gr *group) waitPeers(n int) {
+	gr.t.Helper()
+	waitFor(gr.t, 60*time.Second, "the gossip peers", func() bool {
+		for i, r := range gr.rooms {
+			if !gr.away[i] && !r.removed.Load() && r.gr.Stats().Peers < n {
 				return false
 			}
 		}

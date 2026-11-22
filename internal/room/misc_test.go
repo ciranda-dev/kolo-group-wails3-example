@@ -9,7 +9,6 @@ import (
 	kolostore "github.com/ciranda-dev/kolo-store"
 
 	kolomls "github.com/ciranda-dev/kolo-mls"
-	"github.com/ciranda-dev/kolo-mls/settle"
 )
 
 func TestOpenRefusesWhatItCannotRun(t *testing.T) {
@@ -72,10 +71,22 @@ func TestOperationsRefuseWhatTheyCannotDo(t *testing.T) {
 	if _, err := gr.nodes[0].n.Create(ctx, string(make([]byte, maxName+1)), Policy{}); !errors.Is(err, ErrInvalid) {
 		t.Errorf("Create with a long name: %v", err)
 	}
-	for _, err := range []error{a.Promote(ctx, nil, Admin), a.SetPolicy(ctx, Policy{}), a.Leave(ctx)} {
+	for _, err := range []error{a.Promote(ctx, gr.nodes[1].key(), Settler), a.SetPolicy(ctx, Policy{}), a.Leave(ctx)} {
 		if !errors.Is(err, ErrNotImplemented) {
 			t.Errorf("an unbuilt method: %v", err)
 		}
+	}
+	if err := a.Promote(ctx, nil, Admin); !errors.Is(err, ErrInvalid) {
+		t.Errorf("Promote of no device: %v", err)
+	}
+	if err := a.Promote(ctx, ident(t).PublicKey(), Admin); !errors.Is(err, ErrNotMember) {
+		t.Errorf("Promote of a stranger: %v", err)
+	}
+	if err := b.Promote(ctx, gr.nodes[2].key(), Admin); !errors.Is(err, ErrNotAdmin) {
+		t.Errorf("Promote by a member that is no admin: %v", err)
+	}
+	if err := a.Promote(ctx, gr.nodes[0].key(), Admin); err != nil {
+		t.Errorf("Promote of an admin: %v", err)
 	}
 	if _, err := a.Link(); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("Link: %v", err)
@@ -143,28 +154,6 @@ func TestClosedRoomEndsNext(t *testing.T) {
 	}
 	if len(gr.nodes[1].n.Rooms()) != 0 || gr.nodes[1].n.Allow(gr.nodes[0].key(), netip4(gr.nodes[0])) {
 		t.Fatal("a closed room still admits its members")
-	}
-}
-
-func TestPinsBoundWhatTheyReturn(t *testing.T) {
-	p := pins{kolostore.NewMemory()}
-	ctx := context.Background()
-	for _, k := range []string{"a/1", "a/2", "a/3", "b/1"} {
-		if err := p.Put(ctx, k, []byte("value")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := p.Get(ctx, "nope", 0); !errors.Is(err, settle.ErrMissing) {
-		t.Fatalf("a missing key: %v", err)
-	}
-	if _, err := p.Get(ctx, "a/1", 3); !errors.Is(err, settle.ErrPinTooLarge) {
-		t.Fatalf("a value past the bound: %v", err)
-	}
-	if ks, err := p.List(ctx, "a/", 3); err != nil || len(ks) != 3 {
-		t.Fatalf("List: %v %v", ks, err)
-	}
-	if _, err := p.List(ctx, "a/", 2); !errors.Is(err, settle.ErrPinTooLarge) {
-		t.Fatalf("List past the bound: %v", err)
 	}
 }
 

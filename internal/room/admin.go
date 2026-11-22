@@ -27,7 +27,7 @@ func (r *Room) braidEvents() {
 
 func (r *Room) poke() {
 	select {
-	case r.kick <- struct{}{}:
+	case r.adminKick <- struct{}{}:
 	default:
 	}
 }
@@ -53,8 +53,7 @@ func (r *Room) adminLoop() {
 		r.mu.Unlock()
 		if ap != nil {
 			r.announce(ap)
-			r.emit(evs...)
-			r.finishRemoval()
+			r.applied(evs)
 		}
 		var timeout <-chan time.Time
 		t := time.NewTimer(0)
@@ -63,7 +62,7 @@ func (r *Room) adminLoop() {
 			timeout = t.C
 		}
 		select {
-		case <-r.kick:
+		case <-r.adminKick:
 		case <-timeout:
 		case <-r.ctx.Done():
 		}
@@ -83,35 +82,45 @@ func (r *Room) announce(ap *braid.Applied) {
 
 // commit makes this admin's Commit of o, waits until it settles and applies, and returns the Welcome of the members it
 // adds and the epoch it was made in.
-func (r *Room) commit(ctx context.Context, o kolomls.CommitOptions) (welcome []byte, epoch uint64, err error) {
+func (r *Room) commit(ctx context.Context, o kolomls.CommitOptions) (welcome, settled []byte, epoch uint64, err error) {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
 	if r.admin == nil {
-		return nil, 0, ErrNotAdmin
+		return nil, nil, 0, ErrNotAdmin
 	}
 	if r.removed.Load() {
-		return nil, 0, ErrRemoved
+		return nil, nil, 0, ErrRemoved
 	}
 	r.mu.Lock()
 	r.stepErr = nil
 	epoch = r.m.Epoch()
-	pc, err := r.m.Commit(o)
-	if err != nil {
-		r.mu.Unlock()
-		return nil, 0, err
+	var hash [32]byte
+	if o.SetExtensions {
+		// A roles change is small, and the admin checks it against the braid before it commits.
+		if welcome, err = r.admin.Commit(ctx, o); err != nil {
+			r.mu.Unlock()
+			return nil, nil, 0, err
+		}
+		hash = sha256.Sum256(r.m.Pending().Commit())
+	} else {
+		pc, err := r.m.Commit(o)
+		if err != nil {
+			r.mu.Unlock()
+			return nil, nil, 0, err
+		}
+		// The Commit and its SettledCommit travel in one gossip message; Commits by reference are not built yet.
+		if len(pc.Commit())+settledBound(len(r.view.Load().roles.Settlers))+64 > r.n.limits.MaxMessageSize-envelopeReserve {
+			err = r.m.DiscardPending()
+			r.mu.Unlock()
+			return nil, nil, 0, errors.Join(ErrTooLarge, err)
+		}
+		hash = sha256.Sum256(pc.Commit())
+		welcome = pc.Welcome()
+		err = r.admin.Reference(ctx)
 	}
-	// The Commit and its SettledCommit travel in one gossip message; Commits by reference are not built yet.
-	if len(pc.Commit())+settledBound(len(r.view.Load().roles.Settlers))+64 > r.n.limits.MaxMessageSize-envelopeReserve {
-		err = r.m.DiscardPending()
-		r.mu.Unlock()
-		return nil, 0, errors.Join(ErrTooLarge, err)
-	}
-	hash := sha256.Sum256(pc.Commit())
-	welcome = pc.Welcome()
-	err = r.admin.Reference(ctx)
 	r.mu.Unlock()
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	r.poke()
 	for {
@@ -120,32 +129,24 @@ func (r *Room) commit(ctx context.Context, o kolomls.CommitOptions) (welcome []b
 			break
 		}
 		if r.removed.Load() {
-			return nil, 0, ErrRemoved
+			return nil, nil, 0, ErrRemoved
 		}
 		r.mu.Lock()
 		err := r.stepErr
 		r.mu.Unlock()
 		if err != nil {
-			return nil, 0, err
+			return nil, nil, 0, err
 		}
 		select {
 		case <-ch:
 		case <-ctx.Done():
-			return nil, 0, ctx.Err()
+			return nil, nil, 0, ctx.Err()
 		}
 	}
-	settled, err := r.pins.Get(ctx, settle.SettledKey(r.gid[:], epoch), 0)
-	if err != nil {
-		return nil, 0, err
+	if settled, err = r.settledFor(ctx, epoch, hash); err != nil {
+		return nil, nil, 0, err
 	}
-	st, err := settle.DecodeSettled(settled, 0)
-	if err != nil {
-		return nil, 0, err
-	}
-	if st.TBS.Commit != hash {
-		return nil, 0, errors.New("room: another Commit settled this epoch")
-	}
-	return welcome, epoch, nil
+	return welcome, settled, epoch, nil
 }
 
 // settledBound is kolo-mls's bound on a SettledCommit of n settlers.
@@ -157,19 +158,36 @@ func (r *Room) Add(ctx context.Context, keyPackages ...[]byte) (welcome []byte, 
 	if len(keyPackages) == 0 {
 		return nil, errInvalid("no key package")
 	}
-	w, epoch, err := r.commit(ctx, kolomls.CommitOptions{Add: keyPackages})
-	if err != nil {
-		return nil, err
-	}
-	settled, err := r.pins.Get(ctx, settle.SettledKey(r.gid[:], epoch), 0)
+	w, settled, epoch, err := r.commit(ctx, kolomls.CommitOptions{Add: keyPackages})
 	if err != nil {
 		return nil, err
 	}
 	tree, err := r.pins.Get(ctx, settle.TreeKey(r.gid[:], epoch+1), r.n.limits.MaxTreeBytes+64)
+	if errors.Is(err, settle.ErrMissing) {
+		// The epoch was applied from a Commit another admin settled, so no tree was sealed for it here.
+		r.mu.Lock()
+		if r.m.Epoch() == epoch+1 {
+			tree, err = settle.SealTree(r.m)
+		}
+		r.mu.Unlock()
+	}
 	if err != nil {
 		return nil, err
 	}
-	return (&invite{Welcome: w, Settled: settled, Tree: tree, Secret: r.secret, Name: r.name}).encode(), nil
+	return (&invite{Welcome: w, Settled: settled, Tree: tree, Secret: r.secret, Name: r.name, Logs: r.controlHeaders()}).encode(), nil
+}
+
+// controlHeaders returns the signed headers of the control logs of the room's admins that this device holds.
+func (r *Room) controlHeaders() [][]byte {
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
+	var out [][]byte
+	for _, l := range r.logs {
+		if l.ctl {
+			out = append(out, l.header)
+		}
+	}
+	return out
 }
 
 // Remove removes every device of a person from the room. Only an admin device removes, and the person must have no
@@ -192,6 +210,28 @@ func (r *Room) Remove(ctx context.Context, person ed25519.PublicKey) error {
 	if len(leaves) == 0 {
 		return fmt.Errorf("%w: no device of this person", ErrNotMember)
 	}
-	_, _, err := r.commit(ctx, kolomls.CommitOptions{Remove: leaves})
+	_, _, _, err := r.commit(ctx, kolomls.CommitOptions{Remove: leaves})
 	return err
+}
+
+// settledFor returns the SettledCommit of epoch that names the Commit with the given hash. Each admin's control log may
+// hold one for the epoch, and another admin's may not have reached this device yet.
+func (r *Room) settledFor(ctx context.Context, epoch uint64, hash [32]byte) ([]byte, error) {
+	key := settle.SettledKey(r.gid[:], epoch)
+	for {
+		for _, ref := range r.idx.all(key) {
+			b, err := r.readObject(ref, key)
+			if err != nil {
+				continue
+			}
+			if st, err := settle.DecodeSettled(b, 0); err == nil && st.TBS.Commit == hash {
+				return b, nil
+			}
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%w: the SettledCommit of epoch %d", settle.ErrMissing, epoch)
+		}
+	}
 }

@@ -8,8 +8,6 @@ import (
 	"time"
 
 	kologossip "github.com/ciranda-dev/kolo-gossip"
-	kololog "github.com/ciranda-dev/kolo-log"
-	kolostore "github.com/ciranda-dev/kolo-store"
 	kolosync "github.com/ciranda-dev/kolo-sync"
 
 	"github.com/ciranda-dev/kolo-mls/settle"
@@ -37,7 +35,7 @@ func newHostile(t *testing.T, lim Limits) *hostile {
 }
 
 func (h *hostile) msg(epoch uint64, key *[keySize]byte, seq uint64, c *content) *kologossip.Message {
-	return forged(h.r, key, epoch, h.person, h.deviceA, seq, c)
+	return forged(h.r, key, epoch, h.person, h.a.dev, seq, c)
 }
 
 func TestHostileMessagesAreRefusedWithStableErrors(t *testing.T) {
@@ -81,12 +79,12 @@ func TestReplayedAndForgedSealedBodiesDoNotOpen(t *testing.T) {
 	}
 	asB := *orig
 	asB.Device, asB.Person = h.deviceB, h.b.person.PublicKey()
-	if err := h.r.check(&asB); !errors.Is(err, ErrOpen) {
+	if err := h.r.check(&asB); !errors.Is(err, ErrSignature) {
 		t.Fatalf("a member's sealed body under another member's envelope: %v", err)
 	}
 	again := *orig
 	again.Seq = 11
-	if err := h.r.check(&again); !errors.Is(err, ErrOpen) {
+	if err := h.r.check(&again); !errors.Is(err, ErrSignature) {
 		t.Fatalf("a sealed body under another sequence number: %v", err)
 	}
 }
@@ -137,7 +135,7 @@ func TestFloodIsBoundedByTheRate(t *testing.T) {
 	accepted, refused := 0, 0
 	for i := range 50 {
 		// Device b has sent nothing yet, so its bucket is full.
-		switch err := h.r.check(forged(h.r, &h.key, h.epoch, h.b.person.PublicKey(), h.deviceB, uint64(100+i), good)); {
+		switch err := h.r.check(forged(h.r, &h.key, h.epoch, h.b.person.PublicKey(), h.b.dev, uint64(100+i), good)); {
 		case err == nil:
 			accepted++
 		case errors.Is(err, ErrRate):
@@ -149,7 +147,7 @@ func TestFloodIsBoundedByTheRate(t *testing.T) {
 	if accepted != 5 || refused != 45 {
 		t.Fatalf("%d accepted, %d refused of 50 at once under a burst of 5", accepted, refused)
 	}
-	if got := h.r.validate(context.Background(), forged(h.r, &h.key, h.epoch, h.b.person.PublicKey(), h.deviceB, 999, good)); got != kologossip.Reject {
+	if got := h.r.validate(context.Background(), forged(h.r, &h.key, h.epoch, h.b.person.PublicKey(), h.b.dev, 999, good)); got != kologossip.Reject {
 		t.Fatalf("verdict %v for a message over the rate", got)
 	}
 	l := newLimiter(5, 5)
@@ -265,22 +263,11 @@ func TestSyncAndGossipShareOneConnection(t *testing.T) {
 	gr := newGroup(t, 3, Limits{})
 	gr.waitMesh(2)
 	a, b := gr.nodes[0], gr.nodes[1]
-	st := kolostore.New(kolostore.NewMemory())
-	defer st.Close()
-	l, err := st.Create(a.dev)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := l.Append([]byte("entry")); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.n.sync.Offer(l); err != nil {
-		t.Fatal(err)
-	}
+	ctl := gr.rooms[0].ctl
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	waitFor(t, 10*time.Second, "a connection from b to a", func() bool { return b.conn(a.key()) != nil })
-	if _, err := kolosync.FetchHeader(ctx, b.conn(a.key()), a.key(), kololog.LogID(l.ID())); err != nil {
+	waitFor(t, 10*time.Second, "a connection from b to a", func() bool { return b.n.syncConn(a.key()) != nil })
+	if _, err := kolosync.FetchHeader(ctx, b.n.syncConn(a.key()), a.key(), ctl.id); err != nil {
 		t.Fatalf("a member fetching a log over the shared connection: %v", err)
 	}
 	if _, err := gr.rooms[0].Send(ctx, []byte("still gossiping"), MessageID{}); err != nil {
@@ -320,7 +307,7 @@ func FuzzCheck(f *testing.F) {
 	gr := newGroup(f, 2, Limits{Rate: 1e6, Burst: 1 << 20})
 	r, a := gr.rooms[1], gr.nodes[0]
 	v := r.view.Load()
-	good := forged(r, &v.key, v.epoch, a.person.PublicKey(), a.key(), 1, &content{Time: time.Now().UnixMilli(), Body: []byte("x")}).Body
+	good := forged(r, &v.key, v.epoch, a.person.PublicKey(), a.dev, 1, &content{Time: time.Now().UnixMilli(), Body: []byte("x")}).Body
 	f.Add(good)
 	f.Add((&commitMsg{Settled: (&settle.Settled{TBS: settle.TBS{GroupID: r.gid[:], Epoch: v.epoch}}).Encode(), Commit: []byte{1}}).encode())
 	f.Add([]byte{kindCommit, 0xff, 0xff})

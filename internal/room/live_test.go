@@ -11,6 +11,7 @@ import (
 	"time"
 
 	kologossip "github.com/ciranda-dev/kolo-gossip"
+	koloid "github.com/ciranda-dev/kolo-id"
 	koloswarm "github.com/ciranda-dev/kolo-swarm"
 )
 
@@ -102,12 +103,17 @@ func TestThreeNodesDeliverEveryMessage(t *testing.T) {
 
 // forged is a gossip message as a hostile member could publish it: a body sealed under key for epoch, with the
 // device and sequence the envelope would carry.
-func forged(r *Room, key *[keySize]byte, epoch uint64, person, device ed25519.PublicKey, seq uint64, c *content) *kologossip.Message {
+func forged(r *Room, key *[keySize]byte, epoch uint64, person ed25519.PublicKey, signer *koloid.Identity, seq uint64, c *content) *kologossip.Message {
+	device := signer.PublicKey()
 	nonce, ct, err := seal(key, aad(r.gid[:], epoch, device, seq), c.encode())
 	if err != nil {
 		panic(err)
 	}
-	body := (&sealed{Epoch: epoch, Nonce: nonce, CT: ct}).encode()
+	s := &sealed{Epoch: epoch, Nonce: nonce, CT: ct}
+	if err := signSealed(signer, r.gid[:], s, seq); err != nil {
+		panic(err)
+	}
+	body := s.encode()
 	return &kologossip.Message{ID: MessageID{byte(seq), byte(seq >> 8), 1}, Person: person, Device: device, Seq: seq, Time: time.Now(), Body: body}
 }
 
@@ -187,13 +193,13 @@ func TestRemovedDeviceRefusedAfterSettledCommit(t *testing.T) {
 	c.kmu.RLock()
 	oldKey := c.keys[e]
 	c.kmu.RUnlock()
-	cPerson, cDev := gr.nodes[2].person.PublicKey(), gr.nodes[2].key()
+	cPerson, cDev, cID := gr.nodes[2].person.PublicKey(), gr.nodes[2].key(), gr.nodes[2].dev
 	if err := a.Remove(ctx, cPerson); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 30*time.Second, "b at the new epoch", func() bool { return b.Status().Epoch == e+1 })
 	// Messages sealed in the old epoch still pass while its window lasts.
-	if err := b.check(forged(b, &oldKey, e, cPerson, cDev, 1, hello(b))); err != nil {
+	if err := b.check(forged(b, &oldKey, e, cPerson, cID, 1, hello(b))); err != nil {
 		t.Fatalf("a message of the previous epoch inside its window: %v", err)
 	}
 	waitFor(t, 30*time.Second, "c told it was removed", func() bool {
@@ -211,7 +217,7 @@ func TestRemovedDeviceRefusedAfterSettledCommit(t *testing.T) {
 		t.Fatalf("Next after removal: %v", err)
 	}
 	time.Sleep(400 * time.Millisecond)
-	if err := b.check(forged(b, &oldKey, e, cPerson, cDev, 2, hello(b))); !errors.Is(err, ErrWrongEpoch) {
+	if err := b.check(forged(b, &oldKey, e, cPerson, cID, 2, hello(b))); !errors.Is(err, ErrWrongEpoch) {
 		t.Fatalf("a message of the removed device after the window: %v", err)
 	}
 	if _, err := (authors{b}).Lookup(topicOf(b.secret), cPerson, cDev); !errors.Is(err, kologossip.ErrUnknownAuthor) {
@@ -238,6 +244,12 @@ func TestRemovedDeviceRefusedAfterSettledCommit(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if gr.recs[2].has("after the removal") {
 		t.Fatal("the removed device received a message sent after its removal")
+	}
+	// A removed device that restarts has no room to reopen.
+	gr.stop(2)
+	gr.nodes[2].restart()
+	if rooms := gr.nodes[2].n.Rooms(); len(rooms) != 0 {
+		t.Fatalf("a removed device reopened %d rooms", len(rooms))
 	}
 }
 
