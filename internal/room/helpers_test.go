@@ -134,6 +134,8 @@ type tnodeOpts struct {
 	noServe bool                                         // the test serves no connection: a device that is no member
 	policy  Policy                                       // the policy a created room gets
 	serve   bool                                         // Config.ServeTree
+	// beforeOpen, when set, replaces the bootstrap of a start: it gets the swarm before the room node opens.
+	beforeOpen func(*koloswarm.Swarm)
 }
 
 func newTNode(t testing.TB, o tnodeOpts) *tnode {
@@ -198,7 +200,9 @@ func (tn *tnode) start() {
 		t.Fatal(err)
 	}
 	tn.sw = sw
-	if o.server != nil {
+	if o.beforeOpen != nil {
+		o.beforeOpen(sw)
+	} else if o.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := sw.Bootstrap(ctx, []netip.AddrPort{addrOf(o.server.Addr())}); err != nil {

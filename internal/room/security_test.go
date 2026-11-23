@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"net/netip"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	kologossip "github.com/ciranda-dev/kolo-gossip"
 	"github.com/ciranda-dev/kolo-mls/settle"
 	kolostore "github.com/ciranda-dev/kolo-store"
+	koloswarm "github.com/ciranda-dev/kolo-swarm"
 )
 
 // A member that may not post under the current policy cannot post by sealing under the key of an epoch before the
@@ -584,5 +586,25 @@ func TestReopenWritesTheLinkAndStateACrashLost(t *testing.T) {
 	}
 	if !ownRecord(t, r, ctlLink, e+1) || !ownRecord(t, r, ctlRead, e+1) {
 		t.Fatalf("link of epoch %d: %v, readers' state: %v", e+1, ownRecord(t, r, ctlLink, e+1), ownRecord(t, r, ctlRead, e+1))
+	}
+}
+
+// A device that restarts while no server of the discovery network answers opens its rooms once one does.
+func TestRestartWaitsForTheDiscoveryNetwork(t *testing.T) {
+	gr := newGroup(t, 2, Limits{PinWait: 200 * time.Millisecond})
+	gr.waitMesh(1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	nd := gr.nodes[1]
+	nd.stop()
+	nd.opts.beforeOpen = func(sw *koloswarm.Swarm) {
+		go func() {
+			time.Sleep(time.Second)
+			sw.Bootstrap(ctx, []netip.AddrPort{addrOf(gr.server.Addr())})
+		}()
+	}
+	nd.start()
+	if n := len(nd.n.Rooms()); n != 1 {
+		t.Fatalf("the device reopened %d rooms", n)
 	}
 }

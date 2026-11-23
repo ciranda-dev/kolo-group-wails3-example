@@ -14,6 +14,7 @@ import (
 	"time"
 
 	kolobraid "github.com/ciranda-dev/kolo-braid"
+	kolodht "github.com/ciranda-dev/kolo-dht"
 	kologossip "github.com/ciranda-dev/kolo-gossip"
 	koloid "github.com/ciranda-dev/kolo-id"
 	kololog "github.com/ciranda-dev/kolo-log"
@@ -310,7 +311,7 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 	n.rooms[r.gid] = r
 	n.mu.Unlock()
 	n.refreshMembers()
-	r.gr, err = n.cfg.Gossip.Join(ctx, topicOf(secret), &kologossip.TopicOptions{
+	r.gr, err = n.joinTopic(ctx, topicOf(secret), &kologossip.TopicOptions{
 		Authors: authors{r}, Validate: r.validate, MaxMessageSize: n.limits.MaxMessageSize, Seq: r.cur.Load,
 	})
 	if err != nil {
@@ -324,6 +325,25 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 	r.wg.Go(r.syncLoop)
 	r.wg.Go(r.followEvents)
 	return r, nil
+}
+
+// joinTopic joins a room's gossip topic. The swarm join announces the topic, which fails while no server of the discovery
+// network answers: it is tried again, each time after twice the wait before up to PinWait, until ctx ends, so a restart in
+// a moment the network does not answer opens the rooms once it does.
+func (n *Node) joinTopic(ctx context.Context, t kologossip.Topic, o *kologossip.TopicOptions) (*kologossip.Room, error) {
+	wait := 50 * time.Millisecond
+	for {
+		gr, err := n.cfg.Gossip.Join(ctx, t, o)
+		if !errors.Is(err, kolodht.ErrNoNodes) {
+			return gr, err
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return nil, err
+		}
+		wait = min(2*wait, n.limits.PinWait)
+	}
 }
 
 // restore loads what a reopened room kept: its epoch keys, authors, receipts and logs, and stores what a new one starts with.
