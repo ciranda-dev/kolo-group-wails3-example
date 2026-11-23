@@ -260,3 +260,63 @@ func TestWrongHistoryLinkDoesNotHideTheHonestOne(t *testing.T) {
 		t.Fatalf("after a restart %d of %d old messages shown", shown, len(sent))
 	}
 }
+
+// The tree log of an Add is read by its joiner and by the members while its epoch lasts, and never by a reader of the read
+// link or by a member once the room has moved on.
+func TestTreeLogIsNotServedToReadersOrAfterItsEpoch(t *testing.T) {
+	server := newServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	lim := Limits{PinWait: 200 * time.Millisecond}
+	x := newTNode(t, tnodeOpts{server: server, limits: lim})
+	y := newTNode(t, tnodeOpts{server: server, limits: lim})
+	y2 := newTNode(t, tnodeOpts{server: server, limits: lim})
+	admin, err := x.n.Create(ctx, "public", Policy{AdminsPost: true, ReadLink: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := admin.Add(ctx, kpOf(t, y), kpOf(t, y2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, nd := range []*tnode{y, y2} {
+		if _, err := nd.n.Join(ctx, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link, err := admin.Link()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTNode(t, tnodeOpts{server: server, limits: lim})
+	if _, err := s.n.JoinLink(ctx, link); err != nil {
+		t.Fatal(err)
+	}
+	z := newTNode(t, tnodeOpts{server: server, limits: lim})
+	wz, inv := addFor(t, ctx, admin, z)
+	waitFor(t, 30*time.Second, "the reader and the member connected to the admin", func() bool {
+		return x.n.syncConn(s.key()) != nil && x.n.syncConn(y.key()) != nil && x.n.syncConn(y2.key()) != nil
+	})
+	fetch := func(nd *tnode, d time.Duration) error {
+		fctx, fcancel := context.WithTimeout(ctx, d)
+		defer fcancel()
+		_, err := nd.n.fetchTree(fctx, inv)
+		return err
+	}
+	if err := fetch(s, 3*time.Second); err == nil {
+		t.Fatal("a reader of the read link pulled the tree log")
+	}
+	if err := fetch(y, 20*time.Second); err != nil {
+		t.Fatalf("a member in the epoch of the tree: %v", err)
+	}
+	e := admin.Status().Epoch
+	if err := admin.SetPolicy(ctx, Policy{AdminsPost: true, ReadLink: true, History: SinceEpoch, Since: e}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fetch(y2, 3*time.Second); err == nil {
+		t.Fatal("a member pulled the tree log of an epoch the room has left")
+	}
+	if _, err := z.n.Join(ctx, wz); err != nil {
+		t.Fatalf("the joiner: %v", err)
+	}
+}
