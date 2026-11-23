@@ -22,7 +22,7 @@ type Limits struct {
 	MaxTreeBytes   int           // largest ratchet tree a join accepts
 
 	SegmentEntries int           // entries a segment log holds before the next one opens
-	KeepSegments   int           // closed segments a device keeps and serves for each room
+	KeepSegments   int           // closed segments a device keeps and serves for each room, and apart from them control logs it has left
 	MaxLogs        int           // replicas a room follows of its admins' logs; the device's own logs do not count
 	PinGap         time.Duration // least time between two pushes of a log to the pins
 	PinTTL         time.Duration // how long a capability for the pins lasts

@@ -642,13 +642,13 @@ func (r *Room) epochChanged() {
 	}
 }
 
-// trimLocked forgets, past KeepSegments and the oldest first, the closed segments that are complete, read
+// trimLocked forgets, past KeepSegments for each kind and the oldest first, the closed segments that are complete, read
 // and pushed, and the replicas of control logs that are read and left. A replica is deleted from the store: the pins and
 // the other members hold the log. An admin's own segment stays in the store and is only closed, since it may be the only
 // copy. A control log that History asked for goes as soon as it is read: what History needs of it is kept apart.
 func (r *Room) trimLocked() {
 	r.trimTreesLocked()
-	var replicas, own, read []*roomLog
+	var ctls, segs, own, read []*roomLog
 	epoch := r.view.Load().epoch
 	for _, l := range r.logs {
 		switch {
@@ -657,12 +657,12 @@ func (r *Room) trimLocked() {
 		case l.ctl && l.past:
 			read = append(read, l)
 		case l.ctl && l.epoch < epoch:
-			replicas = append(replicas, l)
+			ctls = append(ctls, l)
 		case l.ctl || r.isPast(l) || !l.complete():
 		case l.own:
 			own = append(own, l)
 		case l.cursor >= l.size:
-			replicas = append(replicas, l)
+			segs = append(segs, l)
 		}
 	}
 	if len(read) > 0 {
@@ -675,7 +675,7 @@ func (r *Room) trimLocked() {
 			r.forgetLocked(l, true)
 		}
 	}
-	for _, ls := range [][]*roomLog{replicas, own} {
+	for _, ls := range [][]*roomLog{ctls, segs, own} {
 		if len(ls) <= r.n.limits.KeepSegments {
 			continue
 		}

@@ -240,6 +240,38 @@ type emptyView struct{}
 func (emptyView) Len() uint64                { return 0 }
 func (emptyView) Get(uint64) ([]byte, error) { return nil, errors.New("empty") }
 
+// A member keeps KeepSegments closed segments, and the control logs it has left apart from them.
+func TestControlLogsDoNotTakeTheRoomOfSegments(t *testing.T) {
+	gr := newGroup(t, 2, Limits{KeepSegments: 4})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	gr.advance(t, ctx, 12, "e")
+	m := gr.rooms[1]
+	count := func() (segs, ctls int) {
+		m.logMu.Lock()
+		defer m.logMu.Unlock()
+		for _, l := range m.logs {
+			switch {
+			case l.own || l.tree:
+			case l.ctl && l.done:
+				ctls++
+			case !l.ctl && l.closed:
+				segs++
+			}
+		}
+		return
+	}
+	dl := time.Now().Add(20 * time.Second)
+	for time.Now().Before(dl) {
+		if s, c := count(); s == 4 && c <= 4 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	s, c := count()
+	t.Fatalf("the member keeps %d closed segments and %d control logs it has left, want 4 segments (KeepSegments 4)", s, c)
+}
+
 // A member keeps no record of the control logs before the ones it follows when it reads no History.
 func TestPrevsDoNotGrowWithEpochs(t *testing.T) {
 	gr := newGroup(t, 2, Limits{})
