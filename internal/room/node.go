@@ -121,32 +121,56 @@ func (n *Node) reopen(ctx context.Context) error {
 	if err = errors.Join(err, derr); err != nil {
 		return err
 	}
+	// The rooms open together, so none waits for the topic join of another while the discovery network does not answer.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		first error
+	)
 	for _, f := range rooms {
-		m, err := settle.OpenMember(n.cfg.MLSStore, f.gid[:], n.mlsConfig(), settle.MemberOptions{})
-		if err != nil {
-			return fmt.Errorf("room: reopening %x: %w", f.gid[:4], err)
-		}
-		r, err := n.newRoom(ctx, f.mt.Name, m, f.mt.Secret, f.mt, nil)
-		if err != nil {
-			m.Close()
-			return err
-		}
-		if f.mt.Braid {
-			b, order, err := openBraid(ctx, n.cfg.Device, n.cfg.Backend, []byte(f.mt.Prefix+"b/"), n.cfg.BraidLimits)
-			if err != nil {
-				r.Close()
-				return err
+		wg.Go(func() {
+			if err := n.reopenRoom(ctx, f.gid, f.mt); err != nil {
+				mu.Lock()
+				if first == nil {
+					first = err
+					cancel()
+				}
+				mu.Unlock()
 			}
-			if !r.view.Load().roles.Admin(n.cfg.Device.PublicKey()) {
-				r.holdBraid(b, order, f.mt.Prefix)
-				continue
-			}
-			if err := r.startAdmin(b, order); err != nil {
-				b.Close()
-				r.Close()
-				return err
-			}
-		}
+		})
+	}
+	wg.Wait()
+	return first
+}
+
+func (n *Node) reopenRoom(ctx context.Context, gid GroupID, mt *meta) error {
+	m, err := settle.OpenMember(n.cfg.MLSStore, gid[:], n.mlsConfig(), settle.MemberOptions{})
+	if err != nil {
+		return fmt.Errorf("room: reopening %x: %w", gid[:4], err)
+	}
+	r, err := n.newRoom(ctx, mt.Name, m, mt.Secret, mt, nil)
+	if err != nil {
+		m.Close()
+		return err
+	}
+	if !mt.Braid {
+		return nil
+	}
+	b, order, err := openBraid(ctx, n.cfg.Device, n.cfg.Backend, []byte(mt.Prefix+"b/"), n.cfg.BraidLimits)
+	if err != nil {
+		r.Close()
+		return err
+	}
+	if !r.view.Load().roles.Admin(n.cfg.Device.PublicKey()) {
+		r.holdBraid(b, order, mt.Prefix)
+		return nil
+	}
+	if err := r.startAdmin(b, order); err != nil {
+		b.Close()
+		r.Close()
+		return err
 	}
 	return nil
 }

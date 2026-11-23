@@ -336,7 +336,7 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 func (n *Node) joinTopic(ctx context.Context, t kologossip.Topic, o *kologossip.TopicOptions) (*kologossip.Room, error) {
 	wait := 50 * time.Millisecond
 	for {
-		gr, err := n.cfg.Gossip.Join(ctx, t, o)
+		gr, err := gossipJoin(n.cfg.Gossip, ctx, t, o)
 		if !errors.Is(err, kolodht.ErrNoNodes) {
 			return gr, err
 		}
@@ -348,6 +348,9 @@ func (n *Node) joinTopic(ctx context.Context, t kologossip.Topic, o *kologossip.
 		wait = min(2*wait, n.limits.PinWait)
 	}
 }
+
+// gossipJoin is Gossip.Join, which a test slows down.
+var gossipJoin = (*kologossip.Gossip).Join
 
 // allowPeer admits to the room's topic the devices of its current epoch, and of the previous one while its window lasts;
 // a room with a read link, or read with one, admits any device. A node that admits any device to its connections, for a

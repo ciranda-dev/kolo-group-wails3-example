@@ -3,9 +3,11 @@ package room
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	kologossip "github.com/ciranda-dev/kolo-gossip"
 	kololog "github.com/ciranda-dev/kolo-log"
 	kolostore "github.com/ciranda-dev/kolo-store"
 )
@@ -328,5 +330,32 @@ func TestFarEpochSegmentIsRefused(t *testing.T) {
 	m.logMu.Unlock()
 	if followed || !hasErr(gr.recs[1], ErrWrongEpoch) || m.Status().CatchingUp {
 		t.Fatalf("a segment of epoch 2^40: followed %v, reported %v, catching up %v", followed, hasErr(gr.recs[1], ErrWrongEpoch), m.Status().CatchingUp)
+	}
+}
+
+// A restart opens its rooms together: none waits for the topic join of another.
+func TestReopenJoinsTheRoomsTogether(t *testing.T) {
+	nd := newTNode(t, tnodeOpts{server: newServer(t)})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	for i := range 4 {
+		if _, err := nd.n.Create(ctx, fmt.Sprint("room ", i), Policy{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	join := gossipJoin
+	t.Cleanup(func() { gossipJoin = join })
+	gossipJoin = func(g *kologossip.Gossip, ctx context.Context, tp kologossip.Topic, o *kologossip.TopicOptions) (*kologossip.Room, error) {
+		time.Sleep(time.Second)
+		return join(g, ctx, tp, o)
+	}
+	start := time.Now()
+	nd.restart()
+	d := time.Since(start)
+	if n := len(nd.n.Rooms()); n != 4 {
+		t.Fatalf("the restart reopened %d of 4 rooms", n)
+	}
+	if d >= 3*time.Second {
+		t.Fatalf("a restart with 4 rooms whose topic joins take 1s each took %v", d.Round(time.Millisecond))
 	}
 }
