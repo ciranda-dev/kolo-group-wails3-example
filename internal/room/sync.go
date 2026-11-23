@@ -704,6 +704,13 @@ func (r *Room) checkPins() {
 
 type pinConn struct{ cancel context.CancelFunc }
 
+// missing reports whether l is a replica that may lack entries: it is not a closed segment that holds its final size.
+func (r *Room) missing(l *roomLog) bool {
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
+	return l.rep != nil && !l.complete()
+}
+
 // followPin pulls the room's logs from a pin on a connection until ctx ends, every PinWait: a pin offers a log to the
 // first peer that asks for it, so a watch of it that comes first learns nothing (see the library gaps of the roadmap).
 func (r *Room) followPin(ctx context.Context, p pin.Peer, c *pinConn) {
@@ -726,7 +733,7 @@ func (r *Room) followPin(ctx context.Context, p pin.Peer, c *pinConn) {
 	for dctx.Err() == nil {
 		grew := false
 		for _, l := range r.snapshot() {
-			if l.rep == nil || l.complete() {
+			if !r.missing(l) {
 				continue
 			}
 			before := l.rep.Len()

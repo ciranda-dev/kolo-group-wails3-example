@@ -320,3 +320,36 @@ func TestTreeLogIsNotServedToReadersOrAfterItsEpoch(t *testing.T) {
 		t.Fatalf("the joiner: %v", err)
 	}
 }
+
+// What followPin reads of a segment does not race with the sync loop closing it (run with -race).
+func TestPinPullReadsSegmentStateUnderItsLock(t *testing.T) {
+	gr := newGroup(t, 2, Limits{})
+	gr.waitMesh(1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if _, err := gr.rooms[0].Send(ctx, []byte("x"), MessageID{}); err != nil {
+		t.Fatal(err)
+	}
+	m := gr.rooms[1]
+	var seg, ctl *roomLog
+	waitFor(t, 20*time.Second, "a replica of a segment", func() bool {
+		for _, l := range m.snapshot() {
+			if !l.own && !l.ctl && !l.tree {
+				seg = l
+			}
+			if l.ctl && !l.own {
+				ctl = l
+			}
+		}
+		return seg != nil && ctl != nil
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 1000 {
+			m.missing(seg)
+		}
+	}()
+	m.applyCtl(ctl, 0, &ctlRecord{Kind: ctlClose, ID: seg.id, Size: 1})
+	<-done
+}
