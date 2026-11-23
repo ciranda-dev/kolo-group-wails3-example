@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -277,22 +278,26 @@ func (r *Room) Policy() Policy { return r.view.Load().pol.public() }
 // never for the ones before: a message sealed earlier is judged by the policy of its own epoch, and a history rule never
 // reaches back before the epochs its links already cover. Only an admin sets the policy.
 func (r *Room) SetPolicy(ctx context.Context, p Policy) error {
-	v := r.view.Load()
 	if r.reader {
 		return ErrNotAdmin
 	}
-	np, err := p.build(v.pol)
-	if err != nil {
+	if _, err := p.build(nil); err != nil {
 		return err
 	}
-	np.hist = v.pol.hist.next(np.hist, v.epoch)
-	if bytes.Equal(np.encode(), v.pol.encode()) {
+	_, _, _, err := r.commit(ctx, func(v *view) (kolomls.CommitOptions, error) {
+		np, err := p.build(v.pol)
+		if err != nil {
+			return kolomls.CommitOptions{}, err
+		}
+		np.hist = v.pol.hist.next(np.hist, v.epoch)
+		if bytes.Equal(np.encode(), v.pol.encode()) {
+			return kolomls.CommitOptions{}, errNoChange
+		}
+		exts, err := groupExtensions(v.roles, np)
+		return kolomls.CommitOptions{SetExtensions: true, Extensions: exts}, err
+	})
+	if errors.Is(err, errNoChange) {
 		return nil
 	}
-	exts, err := groupExtensions(v.roles, np)
-	if err != nil {
-		return err
-	}
-	_, _, _, err = r.commit(ctx, kolomls.CommitOptions{SetExtensions: true, Extensions: exts})
 	return err
 }

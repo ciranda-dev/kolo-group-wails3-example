@@ -62,3 +62,27 @@ func TestPostIntoAnEpochBeforeTheAuthorJoinedIsRefused(t *testing.T) {
 		t.Fatalf("a post of the epoch the device joined in: %v", err)
 	}
 }
+
+// A SetPolicy that settles while a Promote waits for its device is kept: the Promote's Commit is built from the view of the
+// moment it commits.
+func TestPromoteKeepsAPolicySetWhileItWaits(t *testing.T) {
+	p0 := ident(t)
+	gr := newGroupWith(t, 2, Limits{}, func(o *tnodeOpts) { o.person = p0 })
+	gr.waitMesh(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	admin := gr.rooms[0]
+	done := make(chan error, 1)
+	go func() { done <- admin.Promote(ctx, gr.nodes[1].key(), Admin) }()
+	time.Sleep(5 * time.Millisecond)
+	if err := admin.SetPolicy(ctx, Policy{Posters: []ed25519.PublicKey{p0.PublicKey()}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	v := admin.view.Load()
+	if len(v.pol.persons) != 1 || len(v.roles.Admins) != 2 {
+		t.Fatalf("after Promote: %d posters, %d admins at epoch %d", len(v.pol.persons), len(v.roles.Admins), v.epoch)
+	}
+}

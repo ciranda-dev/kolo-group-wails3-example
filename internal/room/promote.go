@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -100,14 +101,23 @@ func (r *Room) Promote(ctx context.Context, device ed25519.PublicKey, role Role)
 			return ctx.Err()
 		}
 	}
-	next := *v.roles
-	next.Admins = append(slices.Clone(v.roles.Admins), dev)
-	slices.SortFunc(next.Admins, func(a, b [32]byte) int { return bytes.Compare(a[:], b[:]) })
-	exts, err := groupExtensions(&next, v.pol)
-	if err != nil {
-		return err
+	_, _, _, err = r.commit(ctx, func(v *view) (kolomls.CommitOptions, error) {
+		switch {
+		case v.author(dev) == nil:
+			return kolomls.CommitOptions{}, fmt.Errorf("%w: no such device", ErrNotMember)
+		case v.roles.Admin(device):
+			return kolomls.CommitOptions{}, errNoChange
+		}
+		next := *v.roles
+		next.Admins = append(slices.Clone(v.roles.Admins), dev)
+		slices.SortFunc(next.Admins, func(a, b [32]byte) int { return bytes.Compare(a[:], b[:]) })
+		exts, err := groupExtensions(&next, v.pol)
+		return kolomls.CommitOptions{SetExtensions: true, Extensions: exts}, err
+	})
+	if errors.Is(err, errNoChange) {
+		return nil
 	}
-	if _, _, _, err := r.commit(ctx, kolomls.CommitOptions{SetExtensions: true, Extensions: exts}); err != nil {
+	if err != nil {
 		return err
 	}
 	if err := r.appendCtl(&ctlRecord{Kind: ctlDir, Header: req.Header}); err != nil {
