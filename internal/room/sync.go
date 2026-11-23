@@ -214,7 +214,7 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 		r.logMu.Unlock()
 	case ctlNext:
 		hd, err := kololog.DecodeLogHeader(rec.Header)
-		if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) {
+		if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) || !v.roles.Admin(l.owner[:]) {
 			return false
 		}
 		r.logMu.Lock()
@@ -224,7 +224,7 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 		return r.addLog(l.owner, rec.Header, true, rec.Epoch)
 	case ctlPrev:
 		hd, err := kololog.DecodeLogHeader(rec.Header)
-		if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) {
+		if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) || !v.roles.Admin(l.owner[:]) {
 			return false
 		}
 		r.logMu.Lock()
