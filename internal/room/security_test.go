@@ -567,7 +567,7 @@ func TestReopenWritesTheLinkAndStateACrashLost(t *testing.T) {
 	}
 	gid := r.ID()
 	time.Sleep(200 * time.Millisecond)
-	before := copyBackend(t, x.logs)
+	logs, state := copyBackend(t, x.logs), copyBackend(t, x.backend)
 	e := r.Status().Epoch
 	if err := r.SetPolicy(ctx, Policy{AdminsPost: true, ReadLink: true, History: SinceEpoch, Since: e}); err != nil {
 		t.Fatal(err)
@@ -575,8 +575,8 @@ func TestReopenWritesTheLinkAndStateACrashLost(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	x.stop()
 	x.store.Close()
-	// The logs as they were before the Commit, with the MLS state and the room's records after it.
-	x.logs, x.store = before, kolostore.New(before)
+	// The logs and the room's records as they were before the Commit, with the MLS state after it.
+	x.logs, x.store, x.backend = logs, kolostore.New(logs), state
 	x.start()
 	if r, err = x.n.Room(gid); err != nil {
 		t.Fatal(err)
@@ -607,4 +607,59 @@ func TestRestartWaitsForTheDiscoveryNetwork(t *testing.T) {
 	if n := len(nd.n.Rooms()); n != 1 {
 		t.Fatalf("the device reopened %d rooms", n)
 	}
+}
+
+// ctlEntries counts the entries of the control logs that r holds, its own when own is set.
+func ctlEntries(r *Room, own bool) (n uint64) {
+	for _, l := range r.snapshot() {
+		if l.ctl && l.own == own {
+			n += l.view.Len()
+		}
+	}
+	return n
+}
+
+// A joiner follows the control logs of the current epoch only, and History reads the epochs before through the logs that
+// those name, one epoch back at a time.
+func TestJoinerPullsOnlyTheCurrentControlLogs(t *testing.T) {
+	gr := newGroup(t, 2, Limits{CatchUpWait: 5 * time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	sent := gr.advance(t, ctx, 6, "old")
+	gr.join(ctx, gr.newNode())
+	r := gr.rooms[2]
+	time.Sleep(time.Second)
+	held, all := ctlEntries(r, false), ctlEntries(gr.rooms[0], true)
+	t.Logf("the joiner holds %d of the %d entries of the admin's control logs", held, all)
+	if held*3 > all {
+		t.Fatalf("the joiner holds %d of the %d entries of the admin's control logs", held, all)
+	}
+	got := bodiesOf(t, readHistory(t, ctx, r, 10))
+	for body, e := range sent {
+		if got[body] != e {
+			t.Errorf("history lacks %s of epoch %d", body, e)
+		}
+	}
+}
+
+// A member forgets the control logs of the epochs it has left, past KeepSegments, and keeps following the room.
+func TestMemberForgetsTheControlLogsOfPastEpochs(t *testing.T) {
+	gr := newGroup(t, 2, Limits{KeepSegments: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	gr.advance(t, ctx, 6, "e")
+	m := gr.rooms[1]
+	waitFor(t, 20*time.Second, "the member to forget the old control logs", func() bool {
+		n := 0
+		for _, l := range m.snapshot() {
+			if l.ctl {
+				n++
+			}
+		}
+		return n <= 3
+	})
+	if _, err := gr.rooms[0].Send(ctx, []byte("still here"), MessageID{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 20*time.Second, "a message after", func() bool { return gr.recs[1].has("still here") })
 }

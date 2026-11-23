@@ -87,22 +87,26 @@ func readHistory(t testing.TB, ctx context.Context, r *Room, page int) []Event {
 	return all
 }
 
-// linkEpochs returns the history links in the control log of an admin, by epoch.
+// linkEpochs returns the history links in the control logs an admin holds of its own, by epoch.
 func linkEpochs(t testing.TB, r *Room) map[uint64][]byte {
 	t.Helper()
 	out := map[uint64][]byte{}
-	l := r.ctl
-	for i := range l.log.Len() {
-		b, err := l.log.Get(i)
-		if err != nil {
-			t.Fatal(err)
+	for _, l := range r.snapshot() {
+		if !l.own || !l.ctl {
+			continue
 		}
-		rec, err := decodeCtl(b, r.n.limits.MaxMessageSize)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if rec.Kind == ctlLink {
-			out[rec.Epoch] = rec.Value
+		for i := range l.log.Len() {
+			b, err := l.log.Get(i)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, err := decodeCtl(b, r.n.limits.MaxMessageSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rec.Kind == ctlLink {
+				out[rec.Epoch] = rec.Value
+			}
 		}
 	}
 	return out

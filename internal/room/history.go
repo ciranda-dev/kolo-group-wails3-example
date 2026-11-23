@@ -154,6 +154,64 @@ func (r *Room) addLink(l *roomLog, rec *ctlRecord) {
 	}
 }
 
+// prevLog is a control log that came before the log of epoch, named by that log's first record.
+type prevLog struct {
+	epoch  uint64
+	owner  [32]byte
+	header []byte
+}
+
+// notePrev remembers the control log before one of epoch rec.Epoch, and follows it at once when History reads that far.
+func (r *Room) notePrev(owner [32]byte, rec *ctlRecord) {
+	p := prevLog{epoch: rec.Epoch, owner: owner, header: rec.Header}
+	r.hmu.Lock()
+	r.prevs = append(r.prevs, p)
+	r.hmu.Unlock()
+	if r.wantPast.Load() {
+		r.followPrev(p)
+	}
+}
+
+// followPrev follows a control log of an epoch before the join when the room's history reaches it.
+func (r *Room) followPrev(p prevLog) {
+	if p.epoch <= r.joinHist().floor(r.joinEpoch) {
+		return
+	}
+	l, err := r.replicate(p.owner, p.header, true, 0)
+	if err != nil {
+		if r.ctx.Err() == nil {
+			r.emit(Event{Kind: CatchingUp, Err: fmt.Errorf("%w: %w", ErrCatchUp, err)})
+		}
+		return
+	}
+	r.logMu.Lock()
+	l.past = true
+	r.logMu.Unlock()
+}
+
+// pastRead reports whether every control log that History needs for epoch e has been followed and read to its end.
+func (r *Room) pastRead(e uint64) bool {
+	r.hmu.Lock()
+	prevs := slices.Clone(r.prevs)
+	r.hmu.Unlock()
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
+	for _, p := range prevs {
+		if p.epoch <= e || p.epoch <= r.joinHist().floor(r.joinEpoch) {
+			continue
+		}
+		hd, err := kololog.DecodeLogHeader(p.header)
+		if err != nil {
+			continue
+		}
+		l := r.logs[keyOf(p.owner, hd.LogID)]
+		if l == nil || !l.done || l.applied < l.view.Len() {
+			return false
+		}
+	}
+	return true
+}
+
 // pastOpen remembers a segment of an epoch before the join that the policy lets this device read.
 func (r *Room) pastOpen(l *roomLog, i uint64, rec *ctlRecord) {
 	if rec.Epoch < r.joinHist().floor(r.joinEpoch) {
@@ -318,6 +376,14 @@ func (r *Room) History(ctx context.Context, before MessageID, n int) ([]Event, e
 	}
 	floor := r.joinHist().floor(r.joinEpoch)
 	if r.hbound > floor {
+		if !r.wantPast.Swap(true) {
+			r.hmu.Lock()
+			prevs := slices.Clone(r.prevs)
+			r.hmu.Unlock()
+			for _, p := range prevs {
+				r.followPrev(p)
+			}
+		}
 		r.waitUntil(ctx, r.controlRead)
 	}
 	var loadErr error
@@ -344,6 +410,7 @@ func (r *Room) History(ctx context.Context, before MessageID, n int) ([]Event, e
 
 // loadEpoch reads the messages of the segments that admins wrote in epoch e, which is before this device joined.
 func (r *Room) loadEpoch(ctx context.Context, e uint64) ([]Event, error) {
+	r.waitUntil(ctx, func() bool { return r.pastRead(e) })
 	if err := r.deriveBack(ctx, e); err != nil {
 		return nil, err
 	}
@@ -440,7 +507,7 @@ func (r *Room) controlRead() bool {
 			continue
 		}
 		r.logMu.Lock()
-		behind := l.applied < l.view.Len()
+		behind := l.applied < l.view.Len() || l.past && !l.done
 		r.logMu.Unlock()
 		if st, err := r.fol.Status(l.owner[:], l.id); behind || err == nil && st.Largest > st.Len {
 			return false

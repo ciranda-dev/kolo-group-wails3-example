@@ -85,6 +85,8 @@ func TestControlRecordRoundTripAndRefusals(t *testing.T) {
 		{Kind: ctlDir, Header: []byte("header")},
 		{Kind: ctlLink, Epoch: 40, Value: make([]byte, linkSize)},
 		{Kind: ctlRead, Epoch: 41, Value: []byte("a sealed state")},
+		{Kind: ctlNext, Epoch: 42, Header: []byte("header")},
+		{Kind: ctlPrev, Epoch: 42, Header: []byte("header")},
 	} {
 		got, err := decodeCtl(c.encode(), 1<<10)
 		if err != nil || got.Kind != c.Kind || got.Key != c.Key || !bytes.Equal(got.Value, c.Value) || got.Epoch != c.Epoch || !bytes.Equal(got.Header, c.Header) || got.ID != c.ID || got.Size != c.Size {
@@ -216,6 +218,8 @@ func FuzzDecodeCtl(f *testing.F) {
 	f.Add((&ctlRecord{Kind: ctlRead, Epoch: 9, Value: []byte("state")}).encode())
 	f.Add((&ctlRecord{Kind: ctlChunk, ID: [32]byte{1}, Index: 1, Count: 3, Value: []byte("piece")}).encode())
 	f.Add((&ctlRecord{Kind: ctlTree, Epoch: 4, Header: []byte("header")}).encode())
+	f.Add((&ctlRecord{Kind: ctlNext, Epoch: 5, Header: []byte("header")}).encode())
+	f.Add((&ctlRecord{Kind: ctlPrev, Epoch: 5, Header: []byte("header")}).encode())
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if c, err := decodeCtl(b, 1<<12); err == nil && !bytes.Equal(c.encode(), b) {
 			t.Fatal("a control record does not encode back to its bytes")

@@ -264,7 +264,7 @@ func (r *Room) controlHeaders() [][]byte {
 	defer r.logMu.Unlock()
 	var out [][]byte
 	for _, l := range r.logs {
-		if l.ctl {
+		if l.ctl && !l.done && !l.past {
 			out = append(out, l.header)
 		}
 	}

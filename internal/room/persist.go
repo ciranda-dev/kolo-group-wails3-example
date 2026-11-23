@@ -160,12 +160,13 @@ type logRec struct {
 	Size   uint64
 	Cursor uint64
 	Header []byte
+	Done   bool // a control log its admin went on from
 }
 
 func (l *logRec) encode() []byte {
 	var e kolocodec.Encoder
 	flags := byte(0)
-	for i, f := range []bool{l.Ctl, l.Own, l.Closed, l.Tree} {
+	for i, f := range []bool{l.Ctl, l.Own, l.Closed, l.Tree, l.Done} {
 		if f {
 			flags |= 1 << i
 		}
@@ -184,10 +185,10 @@ func decodeLogRec(b []byte) (*logRec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: log record", ErrMalformed)
 	}
-	if f[0]&^0xf != 0 {
+	if f[0]&^0x1f != 0 {
 		return nil, fmt.Errorf("%w: log record flags", ErrMalformed)
 	}
-	l := &logRec{Ctl: f[0]&1 != 0, Own: f[0]&2 != 0, Closed: f[0]&4 != 0, Tree: f[0]&8 != 0}
+	l := &logRec{Ctl: f[0]&1 != 0, Own: f[0]&2 != 0, Closed: f[0]&4 != 0, Tree: f[0]&8 != 0, Done: f[0]&16 != 0}
 	if l.Epoch, err = d.Uvarint(); err == nil {
 		if l.Size, err = d.Uvarint(); err == nil {
 			if l.Cursor, err = d.Uvarint(); err == nil {

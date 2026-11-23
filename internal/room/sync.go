@@ -212,6 +212,26 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 			r.persistLogLocked(s)
 		}
 		r.logMu.Unlock()
+	case ctlNext:
+		hd, err := kololog.DecodeLogHeader(rec.Header)
+		if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) {
+			return false
+		}
+		r.logMu.Lock()
+		l.done = true
+		r.persistLogLocked(l)
+		r.logMu.Unlock()
+		return r.addLog(l.owner, rec.Header, true, rec.Epoch)
+	case ctlPrev:
+		hd, err := kololog.DecodeLogHeader(rec.Header)
+		if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) {
+			return false
+		}
+		r.logMu.Lock()
+		l.epoch = max(l.epoch, rec.Epoch)
+		r.persistLogLocked(l)
+		r.logMu.Unlock()
+		r.notePrev(l.owner, rec)
 	case ctlDir:
 		hd, err := kololog.DecodeLogHeader(rec.Header)
 		if err != nil || len(hd.LogKey) != 32 {
@@ -708,7 +728,7 @@ type pinConn struct{ cancel context.CancelFunc }
 func (r *Room) missing(l *roomLog) bool {
 	r.logMu.Lock()
 	defer r.logMu.Unlock()
-	return l.rep != nil && !l.complete()
+	return l.rep != nil && !l.complete() && !(l.ctl && l.done)
 }
 
 // followPin pulls the room's logs from a pin on a connection until ctx ends, every PinWait: a pin offers a log to the

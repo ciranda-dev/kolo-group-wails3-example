@@ -197,10 +197,12 @@ type Room struct {
 	ctl   *roomLog
 	meta  meta
 
-	hmu    sync.Mutex           // guards links, past and pastBy
-	links  map[uint64][]linkRec // the history links of each epoch before the join, one for each admin
-	past   map[uint64][]*pastSeg
-	pastBy map[logKey]*pastSeg
+	hmu      sync.Mutex           // guards links, past, pastBy and prevs
+	links    map[uint64][]linkRec // the history links of each epoch before the join, one for each admin
+	past     map[uint64][]*pastSeg
+	pastBy   map[logKey]*pastSeg
+	prevs    []prevLog   // the control logs that came before the ones followed
+	wantPast atomic.Bool // History has asked for the epochs before the join
 
 	histMu   sync.Mutex // serializes History and guards what follows
 	hbound   uint64     // the epochs from it up are loaded
@@ -488,8 +490,8 @@ func (r *Room) reopenLogs() error {
 			return fmt.Errorf("room: reopening a log: %w", err)
 		}
 		r.logMu.Lock()
-		l.closed, l.size, l.cursor = x.r.Closed, x.r.Size, x.r.Cursor
-		if l.own && l.ctl {
+		l.closed, l.size, l.cursor, l.done = x.r.Closed, x.r.Size, x.r.Cursor, x.r.Done
+		if l.own && l.ctl && (!r.meta.HasCtl || l.id == r.meta.Ctl) {
 			r.ctl = l
 		}
 		if l.own && !l.ctl && !l.tree && !l.closed {
@@ -514,23 +516,27 @@ func (r *Room) reopenLogs() error {
 // the history link and the readers' state of the current epoch when the log lacks them: a crash between applying a Commit
 // and writing them loses them, and with one admin the chain of links would end there.
 func (r *Room) indexOwn() error {
-	l := r.ctl
 	v := r.view.Load()
 	hasLink, hasRead := false, false
-	for i := uint64(0); i < l.log.Len(); i++ {
-		b, err := l.log.Get(i)
-		if err != nil {
-			return err
+	for _, l := range r.logs {
+		if !l.own || !l.ctl {
+			continue
 		}
-		rec, err := decodeCtl(b, r.n.limits.MaxMessageSize)
-		if err != nil {
-			return err
+		for i := uint64(0); i < l.log.Len(); i++ {
+			b, err := l.log.Get(i)
+			if err != nil {
+				return err
+			}
+			rec, err := decodeCtl(b, r.n.limits.MaxMessageSize)
+			if err != nil {
+				return err
+			}
+			r.indexRecord(l, i, rec)
+			hasLink = hasLink || rec.Kind == ctlLink && rec.Epoch == v.epoch
+			hasRead = hasRead || rec.Kind == ctlRead && rec.Epoch == v.epoch
 		}
-		r.indexRecord(l, i, rec)
-		hasLink = hasLink || rec.Kind == ctlLink && rec.Epoch == v.epoch
-		hasRead = hasRead || rec.Kind == ctlRead && rec.Epoch == v.epoch
+		l.applied = l.log.Len()
 	}
-	l.applied = l.log.Len()
 	if r.seg != nil {
 		for i := uint64(0); i < r.seg.log.Len(); i++ {
 			b, err := r.seg.log.Get(i)
@@ -545,7 +551,7 @@ func (r *Room) indexOwn() error {
 	if !v.roles.Admin(r.self) {
 		return nil
 	}
-	var errs []error
+	errs := []error{r.rotateCtl(v.epoch)}
 	if !hasLink {
 		errs = append(errs, r.writeLink(v))
 	}
@@ -964,7 +970,11 @@ func (r *Room) refreshLocked() []Event {
 		return []Event{{Kind: MembersChanged, Err: err}}
 	}
 	// The link goes to the log before the view changes, so no segment of the new epoch comes before it.
-	linkErr := errors.Join(r.notePolicy(v), r.writeLink(v), r.writeRead(v))
+	var rotErr error
+	if v.roles.Admin(r.self) {
+		rotErr = r.rotateCtl(v.epoch)
+	}
+	linkErr := errors.Join(rotErr, r.notePolicy(v), r.writeLink(v), r.writeRead(v))
 	r.view.Store(v)
 	r.notify()
 	r.n.refreshMembers()
