@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"net/netip"
 	"slices"
 	"sync"
@@ -440,21 +441,23 @@ func topicOf(secret [keySize]byte) kologossip.Topic {
 	return kologossip.Topic(h.Sum(nil))
 }
 
-// syncConns returns the kolo-sync part of every connection being served.
-func (n *Node) syncConns() []kolosync.Conn {
+// syncConns returns the kolo-sync part of every connection being served whose remote key keep accepts.
+func (n *Node) syncConns(keep func([32]byte) bool) []kolosync.Conn {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	var out []kolosync.Conn
 	for cs := range n.links {
-		if !cs.done {
+		if !cs.done && keep(cs.key) {
 			out = append(out, cs.mux.sync)
 		}
 	}
 	return out
 }
 
-// fetchTree pulls the sealed tree that an invite names into a replica of its log, from the connections of this node, those
-// that a lookup of the room's topic brings, and then from the pins, and returns it once it hashes to what the invite says.
+// fetchTree pulls the sealed tree that an invite names into a replica of its log, and returns it once it hashes to what the
+// invite says. It asks the admins that the invite names, which a lookup of the room's topic connects, and after PinWait
+// also the pins and any other device (a member may serve by Config.ServeTree); with no server it retries, each time after
+// twice the wait before, up to PinWait, until ctx ends.
 func (n *Node) fetchTree(ctx context.Context, inv *invite) ([]byte, error) {
 	hd, err := kololog.DecodeLogHeader(inv.TreeHeader)
 	if err != nil || len(hd.LogKey) != ed25519.PublicKeySize || inv.TreeEntries == 0 {
@@ -490,9 +493,16 @@ func (n *Node) fetchTree(ctx context.Context, inv *invite) ([]byte, error) {
 	if sw := n.cfg.Swarm; sw != nil {
 		defer sw.Leave(topic)
 	}
-	start, looked := time.Now(), time.Now()
+	admins := map[[32]byte]bool{[32]byte(hd.LogKey): true}
+	for _, h := range inv.Logs {
+		if ch, err := kololog.DecodeLogHeader(h); err == nil && len(ch.LogKey) == ed25519.PublicKeySize {
+			admins[[32]byte(ch.LogKey)] = true
+		}
+	}
+	start, looked, wait := time.Now(), time.Now(), 50*time.Millisecond
 	for rep.Len() < inv.TreeEntries {
-		cs := n.syncConns()
+		late := time.Since(start) >= n.limits.PinWait
+		cs := n.syncConns(func(k [32]byte) bool { return late || admins[k] })
 		if len(cs) == 0 && time.Since(looked) >= time.Second {
 			lookup()
 			looked = time.Now()
@@ -500,17 +510,18 @@ func (n *Node) fetchTree(ctx context.Context, inv *invite) ([]byte, error) {
 		for _, c := range cs {
 			n.pullTree(ctx, c, rep, inv.TreeEntries)
 		}
-		if rep.Len() < inv.TreeEntries && time.Since(start) >= n.limits.PinWait {
+		if rep.Len() < inv.TreeEntries && late {
 			n.pullTreeFromPins(ctx, rep, inv.TreeEntries)
 		}
 		if rep.Len() >= inv.TreeEntries {
 			break
 		}
 		select {
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(wait):
 		case <-ctx.Done():
 			return nil, fmt.Errorf("%w: %d of %d pieces: %w", ErrTree, rep.Len(), inv.TreeEntries, ctx.Err())
 		}
+		wait = min(2*wait, n.limits.PinWait)
 	}
 	if err := l.deriveKeys(); err != nil {
 		return nil, err
@@ -538,8 +549,11 @@ func (n *Node) pullTree(ctx context.Context, conn kolosync.Conn, rep *kolostore.
 	kolosync.PullCiphertext(pctx, conn, rep)
 }
 
+// pullTreeFromPins asks the pins in a random order, so joiners share the load of the pins that hold the log.
 func (n *Node) pullTreeFromPins(ctx context.Context, rep *kolostore.Replica, entries uint64) {
-	for _, p := range n.cfg.Pins {
+	pins := slices.Clone(n.cfg.Pins)
+	mrand.Shuffle(len(pins), func(i, j int) { pins[i], pins[j] = pins[j], pins[i] })
+	for _, p := range pins {
 		if rep.Len() >= entries {
 			return
 		}
