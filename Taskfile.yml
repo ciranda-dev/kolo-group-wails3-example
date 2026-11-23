@@ -40,3 +40,8 @@ tasks:
     summary: Runs the application in development mode
     cmds:
       - wails3 dev -config ./build/config.yml -port {{.VITE_PORT}}
+
+  test-30k:
+    summary: Runs the 30,000-member tests (the gossip simulator and the room tests of a 30,000-leaf group; needs the Kolo workspace, about 13 GB of memory and hours)
+    cmds:
+      - ./scripts/test-30k.sh
