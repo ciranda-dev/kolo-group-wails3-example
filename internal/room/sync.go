@@ -1,6 +1,7 @@
 package room
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -287,10 +288,15 @@ func (r *Room) advanceOnce() bool {
 		r.mu.Unlock()
 		return false
 	}
-	e, max := r.m.Epoch(), r.m.MaxCommitBytes()
+	e, max, pins := r.m.Epoch(), r.m.MaxCommitBytes(), r.pins
 	r.mu.Unlock()
+	v := r.view.Load()
+	if v.epoch != e {
+		return false
+	}
 	key := settle.SettledKey(r.gid[:], e)
-	shares := len(r.view.Load().roles.Settlers)
+	shares := len(v.roles.Settlers)
+	member := func(d [32]byte) bool { return v.author(d) != nil }
 	var cands [][]byte
 	if h := r.hint.Load(); h != nil && h.epoch == e {
 		cands = append(cands, h.settled)
@@ -301,15 +307,24 @@ func (r *Room) advanceOnce() bool {
 		}
 	}
 	for _, sb := range cands {
-		if len(sb) > settledBound(shares) {
+		h := sha256Of(sb)
+		if len(sb) > settledBound(shares) || r.isBad(h) {
 			continue
 		}
 		st, err := settle.DecodeSettled(sb, shares)
 		if err != nil {
-			r.reportEpoch(e, sha256Of(sb), err)
+			r.reportEpoch(e, h, err)
 			continue
 		}
-		commit, err := settle.GetObject(r.ctx, r.pins, st.TBS.Commit, max)
+		// The signatures are checked before the Commit is fetched, so a SettledCommit that no quorum signed costs nothing.
+		if !bytes.Equal(st.TBS.GroupID, r.gid[:]) || st.TBS.Epoch != e || st.TBS.Braid != v.roles.Braid || st.Valid(v.roles, member) < v.roles.Q() {
+			r.reportEpoch(e, h, ErrCommitRef)
+			continue
+		}
+		if r.isBad(st.TBS.Commit) {
+			continue
+		}
+		commit, err := settle.GetObject(r.ctx, pins, st.TBS.Commit, max)
 		if err != nil {
 			continue
 		}
@@ -339,6 +354,13 @@ func (r *Room) advanceOnce() bool {
 		return true
 	}
 	return false
+}
+
+func (r *Room) isBad(hash [32]byte) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, bad := r.badCommits[hash]
+	return bad
 }
 
 // reportEpoch reports a Commit that the control logs hold and the room cannot apply, once for each Commit.

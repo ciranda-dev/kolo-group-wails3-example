@@ -180,7 +180,7 @@ type Room struct {
 	pins       settle.Pins
 	adminKick  chan struct{}
 	stepErr    error                 // guarded by mu
-	badCommits map[[32]byte]struct{} // the Commits of this epoch reported as unusable, guarded by mu
+	badCommits map[[32]byte]struct{} // the Commits and SettledCommits of this epoch reported as unusable, guarded by mu
 
 	kv       roomKV
 	logSec   *kololog.EntrySecret

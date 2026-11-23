@@ -3,9 +3,13 @@ package room
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ciranda-dev/kolo-mls/settle"
 )
 
 // A member that may not post under the current policy cannot post by sealing under the key of an epoch before the
@@ -85,4 +89,53 @@ func TestPromoteKeepsAPolicySetWhileItWaits(t *testing.T) {
 	if len(v.pol.persons) != 1 || len(v.roles.Admins) != 2 {
 		t.Fatalf("after Promote: %d posters, %d admins at epoch %d", len(v.pol.persons), len(v.roles.Admins), v.epoch)
 	}
+}
+
+// countPins counts the Commit objects read through a room's settle.Pins.
+type countPins struct {
+	settle.Pins
+	n *atomic.Int64
+}
+
+func (c countPins) Get(ctx context.Context, key string, max int) ([]byte, error) {
+	if isObject(key) {
+		c.n.Add(1)
+	}
+	return c.Pins.Get(ctx, key, max)
+}
+
+// A SettledCommit with no quorum of settler signatures is reported once and its Commit is never fetched.
+func TestUnsignedSettledCommitIsNotFetched(t *testing.T) {
+	gr := newGroup(t, 2, Limits{})
+	gr.waitMesh(1)
+	admin, member := gr.rooms[0], gr.rooms[1]
+	e := admin.Status().Epoch
+	big := make([]byte, 1<<20)
+	rand.Read(big)
+	h := sha256Of(big)
+	forged := &settle.Settled{TBS: settle.TBS{GroupID: admin.gid[:], Epoch: e, Commit: h, Braid: admin.view.Load().roles.Braid}}
+	var n atomic.Int64
+	member.mu.Lock()
+	member.pins = countPins{member.pins, &n}
+	member.mu.Unlock()
+	if err := admin.appendCtl(append(pieces(h, big), &ctlRecord{Kind: ctlPut, Key: settle.SettledKey(admin.gid[:], e), Value: forged.Encode()})...); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 20*time.Second, "the report of the SettledCommit", func() bool { return len(errEvents(gr.recs[1])) > 0 })
+	time.Sleep(6 * time.Second)
+	if got := n.Load(); got != 0 {
+		t.Fatalf("the member read the Commit of an unsigned SettledCommit %d times", got)
+	}
+	if evs := errEvents(gr.recs[1]); len(evs) != 1 || !errors.Is(evs[0].Err, ErrCommitRef) {
+		t.Fatalf("reports: %v", evs)
+	}
+}
+
+func errEvents(rec *recorder) (out []Event) {
+	for _, ev := range rec.events() {
+		if ev.Err != nil {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
