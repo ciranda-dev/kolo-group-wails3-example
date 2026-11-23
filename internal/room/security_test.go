@@ -13,6 +13,7 @@ import (
 	"time"
 
 	kologossip "github.com/ciranda-dev/kolo-gossip"
+	koloid "github.com/ciranda-dev/kolo-id"
 	"github.com/ciranda-dev/kolo-mls/settle"
 	kolostore "github.com/ciranda-dev/kolo-store"
 	koloswarm "github.com/ciranda-dev/kolo-swarm"
@@ -662,4 +663,65 @@ func TestMemberForgetsTheControlLogsOfPastEpochs(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 20*time.Second, "a message after", func() bool { return gr.recs[1].has("still here") })
+}
+
+// A device that holds only the read link of one room of a node is not told of the node's closed room and gets none of its
+// envelopes, though the node admits it.
+func TestReadLinkHolderGetsNothingOfAnotherRoomOfTheNode(t *testing.T) {
+	server := newServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	x := newTNode(t, tnodeOpts{server: server})
+	y := newTNode(t, tnodeOpts{server: server})
+	closed, err := x.n.Create(ctx, "closed", Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := closed.Add(ctx, kpOf(t, y))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cy, err := y.n.Join(ctx, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := x.n.Create(ctx, "public", Policy{AdminsPost: true, ReadLink: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, err := pub.Link()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger, err := koloid.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !x.n.Allow(stranger.PublicKey(), netip.MustParseAddrPort("127.0.0.1:9")) {
+		t.Fatal("the node does not admit a device of no room")
+	}
+	s := newTNode(t, tnodeOpts{server: server})
+	if _, err := s.n.JoinLink(ctx, link); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 30*time.Second, "the link holder connected to the node", func() bool { return x.n.syncConn(s.key()) != nil })
+	gs, err := s.g.Join(ctx, topicOf(closed.secret), &kologossip.TopicOptions{Open: func(kologossip.Topic, ed25519.PublicKey) ([]*koloid.Revocation, bool) { return nil, true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 30*time.Second, "y in the mesh of the closed room", func() bool { return cy.gr.Stats().Mesh > 0 })
+	go func() {
+		for ctx.Err() == nil {
+			cy.Send(ctx, []byte("between members only"), MessageID{})
+			time.Sleep(300 * time.Millisecond)
+		}
+	}()
+	mctx, mcancel := context.WithTimeout(ctx, 10*time.Second)
+	defer mcancel()
+	if m, err := gs.Next(mctx); err == nil {
+		t.Fatalf("the link holder received an envelope of the closed room from device %x", m.Device[:4])
+	}
+	if st := gs.Stats(); st.Mesh != 0 {
+		t.Fatalf("the link holder is in the closed room's mesh: %+v", st)
+	}
 }

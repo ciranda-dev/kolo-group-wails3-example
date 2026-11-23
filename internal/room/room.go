@@ -314,7 +314,7 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 	n.mu.Unlock()
 	n.refreshMembers()
 	r.gr, err = n.joinTopic(ctx, topicOf(secret), &kologossip.TopicOptions{
-		Authors: authors{r}, Validate: r.validate, MaxMessageSize: n.limits.MaxMessageSize, Seq: r.cur.Load,
+		Authors: authors{r}, Validate: r.validate, MaxMessageSize: n.limits.MaxMessageSize, Seq: r.cur.Load, AllowPeer: r.allowPeer,
 	})
 	if err != nil {
 		n.mu.Lock()
@@ -346,6 +346,34 @@ func (n *Node) joinTopic(ctx context.Context, t kologossip.Topic, o *kologossip.
 		}
 		wait = min(2*wait, n.limits.PinWait)
 	}
+}
+
+// allowPeer admits to the room's topic the devices of its current epoch, and of the previous one while its window lasts;
+// a room with a read link, or read with one, admits any device. A node that admits any device to its connections, for a
+// room with a read link or for a join, so never tells it about its closed rooms.
+func (r *Room) allowPeer(peer ed25519.PublicKey) bool {
+	if len(peer) != ed25519.PublicKeySize {
+		return false
+	}
+	v := r.view.Load()
+	if r.reader || v.pol.link {
+		return true
+	}
+	d := [32]byte(peer)
+	return v.author(d) != nil || v.prev != nil && r.n.now().Before(v.prevUntil) && v.prev.author(d) != nil
+}
+
+// refreshPeers asks the topic again about every connected peer, now and once the window of the previous epoch has ended.
+func (r *Room) refreshPeers() {
+	if r.gr == nil || r.ctx.Err() != nil {
+		return
+	}
+	r.gr.RefreshPeers()
+	time.AfterFunc(r.n.limits.PastEpoch, func() {
+		if r.ctx.Err() == nil {
+			r.gr.RefreshPeers()
+		}
+	})
 }
 
 // restore loads what a reopened room kept: its epoch keys, authors, receipts and logs, and stores what a new one starts with.
@@ -666,14 +694,16 @@ func (r *Room) publish(ctx context.Context, mk func(seq uint64) ([]byte, error))
 	if err != nil {
 		return MessageID{}, err
 	}
-	id, err := r.gr.Publish(ctx, body)
+	m, err := r.gr.Publish(ctx, body)
 	switch {
 	case errors.Is(err, kologossip.ErrTooLarge):
 		return MessageID{}, fmt.Errorf("%w: %w", ErrTooLarge, err)
 	case errors.Is(err, kologossip.ErrNotJoined), errors.Is(err, kologossip.ErrClosed):
 		return MessageID{}, ErrClosed
+	case err != nil:
+		return MessageID{}, err
 	}
-	return id, err
+	return m.ID, nil
 }
 
 // Send posts a message, as a reply when replyTo is not zero. It returns once the message is sent; the message shows in

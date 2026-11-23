@@ -446,6 +446,7 @@ func (r *Room) reportEpoch(epoch uint64, hash [32]byte, err error) {
 
 // applied does what a new epoch asks of the room outside the lock that applied it.
 func (r *Room) applied(evs []Event) {
+	r.refreshPeers()
 	r.emit(evs...)
 	r.finishRemoval()
 	r.epochChanged()
