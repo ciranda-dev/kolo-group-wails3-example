@@ -207,12 +207,15 @@ func (r *Room) contact(device [32]byte) {
 	if !last {
 		return
 	}
+	var err error
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.admin != nil {
-		if err := r.admin.ReleaseWelcome(r.ctx, epoch); err != nil && r.ctx.Err() == nil {
-			r.emit(Event{Kind: MembersChanged, Err: fmt.Errorf("room: releasing the Welcome of epoch %d: %w", epoch, err)})
-		}
+		err = r.admin.ReleaseWelcome(r.ctx, epoch)
+	}
+	r.mu.Unlock()
+	// The event goes out after the lock: a full event queue must not hold the admin loop.
+	if err != nil && r.ctx.Err() == nil {
+		r.emit(Event{Kind: MembersChanged, Err: fmt.Errorf("room: releasing the Welcome of epoch %d: %w", epoch, err)})
 	}
 }
 

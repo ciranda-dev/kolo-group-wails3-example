@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ciranda-dev/kolo-mls/settle"
+	kolostore "github.com/ciranda-dev/kolo-store"
 )
 
 // A member that may not post under the current policy cannot post by sealing under the key of an epoch before the
@@ -352,4 +353,65 @@ func TestPinPullReadsSegmentStateUnderItsLock(t *testing.T) {
 	}()
 	m.applyCtl(ctl, 0, &ctlRecord{Kind: ctlClose, ID: seg.id, Size: 1})
 	<-done
+}
+
+// failDeletes is a backend whose Delete fails once armed.
+type failDeletes struct {
+	kolostore.Backend
+	armed atomic.Bool
+}
+
+func (f *failDeletes) Delete(k []byte) error {
+	if f.armed.Load() {
+		return errors.New("delete refused")
+	}
+	return f.Backend.Delete(k)
+}
+
+// An admin whose event queue is full does not hold the room's lock while it reports that a used Welcome could not be
+// released, so its Commits go on.
+func TestContactReportDoesNotHoldTheRoomLock(t *testing.T) {
+	server := newServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	lim := Limits{EventQueue: 1}
+	x := newTNode(t, tnodeOpts{server: server, limits: lim})
+	y := newTNode(t, tnodeOpts{server: server, limits: lim})
+	r, err := x.n.Create(ctx, "test", Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid := r.ID()
+	w, err := r.Add(ctx, kpOf(t, y))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ry, err := y.n.Join(ctx, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record(t, ry)
+	fd := &failDeletes{Backend: x.backend}
+	x.backend = fd
+	x.restart()
+	if r, err = x.n.Room(gid); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 30*time.Second, "the gossip mesh", func() bool { return r.gr.Stats().Mesh > 0 && ry.gr.Stats().Mesh > 0 })
+	for len(r.events) < cap(r.events) {
+		r.events <- Event{}
+	}
+	fd.armed.Store(true)
+	if _, err := ry.Send(ctx, []byte("hello"), MessageID{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 20*time.Second, "the Welcome taken as used", func() bool { return unused(r) == 0 })
+	time.Sleep(200 * time.Millisecond)
+	waitFor(t, 5*time.Second, "the room lock", func() bool {
+		if !r.mu.TryLock() {
+			return false
+		}
+		r.mu.Unlock()
+		return true
+	})
 }
