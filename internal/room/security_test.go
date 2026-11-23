@@ -519,3 +519,70 @@ func TestRoomSecretAndTopicUseTheirOwnLabels(t *testing.T) {
 		t.Fatal("the room secret is the export under the topic's label")
 	}
 }
+
+// copyBackend returns a copy of what b holds.
+func copyBackend(t *testing.T, b kolostore.Backend) kolostore.Backend {
+	t.Helper()
+	c := kolostore.NewMemory()
+	var err error
+	if serr := b.Scan(nil, nil, false, 0, func(k, v []byte) bool {
+		err = c.Put(k, v)
+		return err == nil
+	}); serr != nil || err != nil {
+		t.Fatal(serr, err)
+	}
+	return c
+}
+
+// ownRecord reports whether this admin's control log holds a record of kind for epoch.
+func ownRecord(t *testing.T, r *Room, kind byte, epoch uint64) bool {
+	t.Helper()
+	r.logMu.Lock()
+	l := r.ctl
+	r.logMu.Unlock()
+	for i := uint64(0); i < l.log.Len(); i++ {
+		b, err := l.log.Get(i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec, err := decodeCtl(b, r.n.limits.MaxMessageSize); err == nil && rec.Kind == kind && rec.Epoch == epoch {
+			return true
+		}
+	}
+	return false
+}
+
+// An admin that stopped after it applied a Commit and before it wrote the history link and the readers' state of the new
+// epoch writes them when it opens the room again.
+func TestReopenWritesTheLinkAndStateACrashLost(t *testing.T) {
+	server := newServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	x := newTNode(t, tnodeOpts{server: server})
+	r, err := x.n.Create(ctx, "test", Policy{AdminsPost: true, ReadLink: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid := r.ID()
+	time.Sleep(200 * time.Millisecond)
+	before := copyBackend(t, x.logs)
+	e := r.Status().Epoch
+	if err := r.SetPolicy(ctx, Policy{AdminsPost: true, ReadLink: true, History: SinceEpoch, Since: e}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	x.stop()
+	x.store.Close()
+	// The logs as they were before the Commit, with the MLS state and the room's records after it.
+	x.logs, x.store = before, kolostore.New(before)
+	x.start()
+	if r, err = x.n.Room(gid); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Status().Epoch; got != e+1 {
+		t.Fatalf("reopened at epoch %d, want %d", got, e+1)
+	}
+	if !ownRecord(t, r, ctlLink, e+1) || !ownRecord(t, r, ctlRead, e+1) {
+		t.Fatalf("link of epoch %d: %v, readers' state: %v", e+1, ownRecord(t, r, ctlLink, e+1), ownRecord(t, r, ctlRead, e+1))
+	}
+}

@@ -95,6 +95,7 @@ type tnode struct {
 	opts    tnodeOpts
 	mls     kolostore.Backend // what a restart keeps: the MLS state, the room's state and the logs
 	backend kolostore.Backend
+	logs    kolostore.Backend // the backend of store, in memory
 	store   *kolostore.Store
 
 	askedMu sync.Mutex
@@ -137,7 +138,8 @@ type tnodeOpts struct {
 
 func newTNode(t testing.TB, o tnodeOpts) *tnode {
 	t.Helper()
-	tn := &tnode{t: t, opts: o, person: o.person, dev: ident(t), mls: kolostore.NewMemory(), backend: kolostore.NewMemory(), store: kolostore.New(kolostore.NewMemory())}
+	tn := &tnode{t: t, opts: o, person: o.person, dev: ident(t), mls: kolostore.NewMemory(), backend: kolostore.NewMemory(), logs: kolostore.NewMemory()}
+	tn.store = kolostore.New(tn.logs)
 	if tn.person == nil {
 		tn.person = ident(t)
 	}

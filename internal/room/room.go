@@ -490,9 +490,13 @@ func (r *Room) reopenLogs() error {
 	return r.indexOwn()
 }
 
-// indexOwn rebuilds the index of this admin's own control log, and the ids of the segment it goes on writing.
+// indexOwn rebuilds the index of this admin's own control log and the ids of the segment it goes on writing, and writes
+// the history link and the readers' state of the current epoch when the log lacks them: a crash between applying a Commit
+// and writing them loses them, and with one admin the chain of links would end there.
 func (r *Room) indexOwn() error {
 	l := r.ctl
+	v := r.view.Load()
+	hasLink, hasRead := false, false
 	for i := uint64(0); i < l.log.Len(); i++ {
 		b, err := l.log.Get(i)
 		if err != nil {
@@ -503,6 +507,8 @@ func (r *Room) indexOwn() error {
 			return err
 		}
 		r.indexRecord(l, i, rec)
+		hasLink = hasLink || rec.Kind == ctlLink && rec.Epoch == v.epoch
+		hasRead = hasRead || rec.Kind == ctlRead && rec.Epoch == v.epoch
 	}
 	l.applied = l.log.Len()
 	if r.seg != nil {
@@ -516,7 +522,17 @@ func (r *Room) indexOwn() error {
 			}
 		}
 	}
-	return nil
+	if !v.roles.Admin(r.self) {
+		return nil
+	}
+	var errs []error
+	if !hasLink {
+		errs = append(errs, r.writeLink(v))
+	}
+	if !hasRead {
+		errs = append(errs, r.writeRead(v))
+	}
+	return errors.Join(errs...)
 }
 
 func (r *Room) closeLogs() {
