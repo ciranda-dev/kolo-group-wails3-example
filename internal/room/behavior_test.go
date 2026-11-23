@@ -1,6 +1,7 @@
 package room
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -18,7 +19,10 @@ import (
 func ctlRecords(t *testing.T, r *Room, own bool) []*ctlRecord {
 	t.Helper()
 	var out []*ctlRecord
-	for _, l := range r.snapshot() {
+	logs := r.snapshot()
+	// A device has a control log per epoch, which the snapshot lists in no order.
+	slices.SortStableFunc(logs, func(a, b *roomLog) int { return cmp.Compare(a.epoch, b.epoch) })
+	for _, l := range logs {
 		if !l.ctl || l.own != own {
 			continue
 		}
