@@ -422,7 +422,7 @@ func TestUndecryptableEntriesOfAPastSegmentAreReported(t *testing.T) {
 	sent := gr.advance(t, ctx, 3, "u")
 	var seg *roomLog
 	for _, l := range admin.snapshot() {
-		if !l.ctl && l.epoch == 2 {
+		if !l.ctl && !l.tree && l.epoch == 2 {
 			seg = l
 		}
 	}
