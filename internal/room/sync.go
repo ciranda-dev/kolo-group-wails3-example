@@ -194,7 +194,7 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 		case !v.roles.Admin(l.owner[:]):
 			return false
 		case rec.Epoch < r.joinEpoch:
-			r.pastOpen(l, i, rec)
+			r.pastOpen(l, rec)
 			return false
 		}
 		return r.addLog(l.owner, rec.Header, false, rec.Epoch)
@@ -219,9 +219,11 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 		}
 		r.logMu.Lock()
 		l.done = true
+		past := l.past
 		r.persistLogLocked(l)
 		r.logMu.Unlock()
-		return r.addLog(l.owner, rec.Header, true, rec.Epoch)
+		// The log after one that History asked for is followed already, or was.
+		return !past && r.addLog(l.owner, rec.Header, true, rec.Epoch)
 	case ctlPrev:
 		hd, err := kololog.DecodeLogHeader(rec.Header)
 		if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) || !v.roles.Admin(l.owner[:]) {
@@ -231,7 +233,7 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 		l.epoch = max(l.epoch, rec.Epoch)
 		r.persistLogLocked(l)
 		r.logMu.Unlock()
-		r.notePrev(l.owner, rec)
+		r.notePrev(l, rec)
 	case ctlDir:
 		hd, err := kololog.DecodeLogHeader(rec.Header)
 		if err != nil || len(hd.LogKey) != 32 {

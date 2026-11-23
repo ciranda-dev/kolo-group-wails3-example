@@ -370,28 +370,39 @@ func (r *Room) replicate(owner [32]byte, header []byte, ctl bool, epoch uint64) 
 }
 
 func (r *Room) replicateKind(owner [32]byte, header []byte, ctl, tree bool, epoch uint64) (*roomLog, error) {
-	hd, err := kololog.DecodeLogHeader(header)
-	if err != nil || !bytes.Equal(hd.LogKey, owner[:]) {
+	return r.replicateAs(&roomLog{owner: owner, header: header, ctl: ctl, tree: tree, epoch: epoch})
+}
+
+// replicateAs opens the replica of the log that l describes. Only replicas count against MaxLogs.
+func (r *Room) replicateAs(l *roomLog) (*roomLog, error) {
+	hd, err := kololog.DecodeLogHeader(l.header)
+	if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) {
 		return nil, fmt.Errorf("%w: log header", ErrMalformed)
 	}
 	r.logMu.Lock()
 	defer r.logMu.Unlock()
-	if l := r.logs[keyOf(owner, hd.LogID)]; l != nil {
-		return l, nil
+	if have := r.logs[keyOf(l.owner, hd.LogID)]; have != nil {
+		return have, nil
 	}
-	if len(r.logs) >= r.n.limits.MaxLogs {
-		return nil, fmt.Errorf("%w: %d logs", ErrTooManyLogs, len(r.logs))
+	n := 0
+	for _, x := range r.logs {
+		if !x.own {
+			n++
+		}
 	}
-	rep, err := r.n.cfg.Store.OpenReplica(owner[:], hd.LogID, header)
+	if n >= r.n.limits.MaxLogs {
+		return nil, fmt.Errorf("%w: %d logs", ErrTooManyLogs, n)
+	}
+	rep, err := r.n.cfg.Store.OpenReplica(l.owner[:], hd.LogID, l.header)
 	if err != nil {
 		return nil, err
 	}
-	d, err := kololog.NewKeyDeriver(r.logSec, owner[:], rep.Header())
+	d, err := kololog.NewKeyDeriver(r.logSec, l.owner[:], rep.Header())
 	if err != nil {
 		rep.Close()
 		return nil, err
 	}
-	l := &roomLog{owner: owner, id: hd.LogID, ctl: ctl, tree: tree, epoch: epoch, header: header, src: rep, view: rep, rep: rep, deriver: d}
+	l.id, l.src, l.view, l.rep, l.deriver = hd.LogID, rep, rep, rep, d
 	if err := r.trackLocked(l); err != nil {
 		l.close()
 		return nil, err
@@ -625,25 +636,37 @@ func (r *Room) epochChanged() {
 	}
 }
 
-// trimLocked forgets the closed segments past KeepSegments, the oldest first, that are complete, read and pushed. A
-// replica is deleted from the store: the pins and the other members hold the log. An admin's own segment stays in the store
-// and is only closed, since it may be the only copy.
+// trimLocked forgets, past KeepSegments and the oldest first, the closed segments that are complete, read
+// and pushed, and the replicas of control logs that are read and left. A replica is deleted from the store: the pins and
+// the other members hold the log. An admin's own segment stays in the store and is only closed, since it may be the only
+// copy. A control log that History asked for goes as soon as it is read: what History needs of it is kept apart.
 func (r *Room) trimLocked() {
 	r.trimTreesLocked()
-	var replicas, own []*roomLog
+	var replicas, own, read []*roomLog
 	epoch := r.view.Load().epoch
 	for _, l := range r.logs {
 		switch {
-		// A replica of a control log goes once its admin went on from it, the room is past its epoch and it is read, unless
-		// History needs it. The admin keeps its own: a member that is behind pulls the Commits from it.
-		case l.ctl && (l.own || !l.done || l.epoch < r.joinEpoch || l.epoch >= epoch || l.applied < l.view.Len()) || r.dirtyLog(l):
-		case l.ctl:
+		// The admin keeps its own control logs: a member that is behind pulls the Commits from them.
+		case l.ctl && (l.own || !l.done || l.applied < l.view.Len()) || r.dirtyLog(l):
+		case l.ctl && l.past:
+			read = append(read, l)
+		case l.ctl && l.epoch < epoch:
 			replicas = append(replicas, l)
-		case r.isPast(l) || !l.complete():
+		case l.ctl || r.isPast(l) || !l.complete():
 		case l.own:
 			own = append(own, l)
 		case l.cursor >= l.size:
 			replicas = append(replicas, l)
+		}
+	}
+	if len(read) > 0 {
+		r.hmu.Lock()
+		r.prevs = slices.DeleteFunc(r.prevs, func(p prevLog) bool {
+			return slices.ContainsFunc(read, func(l *roomLog) bool { return l.key() == p.key() })
+		})
+		r.hmu.Unlock()
+		for _, l := range read {
+			r.forgetLocked(l, true)
 		}
 	}
 	for _, ls := range [][]*roomLog{replicas, own} {

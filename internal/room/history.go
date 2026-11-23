@@ -91,8 +91,8 @@ type linkRec struct {
 
 // pastSeg is a segment of an epoch before this device joined, named by an admin's control log.
 type pastSeg struct {
-	ref    objRef
-	id     kololog.LogID
+	owner  [32]byte
+	header []byte
 	closed bool
 	size   uint64
 }
@@ -154,39 +154,45 @@ func (r *Room) addLink(l *roomLog, rec *ctlRecord) {
 	}
 }
 
-// prevLog is a control log that came before the log of epoch, named by that log's first record.
+// prevLog is a control log that came before the log of epoch, named by that log's first record, which is in the log from.
 type prevLog struct {
 	epoch  uint64
 	owner  [32]byte
 	header []byte
+	from   logKey
 }
 
-// notePrev remembers the control log before one of epoch rec.Epoch, and follows it at once when History reads that far.
-func (r *Room) notePrev(owner [32]byte, rec *ctlRecord) {
-	p := prevLog{epoch: rec.Epoch, owner: owner, header: rec.Header}
+func (p prevLog) key() logKey {
+	hd, err := kololog.DecodeLogHeader(p.header)
+	if err != nil {
+		return logKey{}
+	}
+	return keyOf(p.owner, hd.LogID)
+}
+
+// notePrev remembers, once, the control log before l when History may need it: a log of an epoch before the join that the
+// policy lets this device read. It is followed at once when History is loading an epoch that needs it.
+func (r *Room) notePrev(l *roomLog, rec *ctlRecord) {
+	if rec.Epoch > r.joinEpoch || rec.Epoch <= r.joinHist().floor(r.joinEpoch) {
+		return
+	}
+	p := prevLog{epoch: rec.Epoch, owner: l.owner, header: bytes.Clone(rec.Header), from: l.key()}
 	r.hmu.Lock()
-	r.prevs = append(r.prevs, p)
+	dup := slices.ContainsFunc(r.prevs, func(x prevLog) bool { return x.key() == p.key() })
+	if !dup {
+		r.prevs = append(r.prevs, p)
+	}
 	r.hmu.Unlock()
-	if r.wantPast.Load() {
+	if need := r.needPast.Load(); !dup && need != 0 && p.epoch >= need {
 		r.followPrev(p)
 	}
 }
 
-// followPrev follows a control log of an epoch before the join when the room's history reaches it.
+// followPrev follows a control log that History needs.
 func (r *Room) followPrev(p prevLog) {
-	if p.epoch <= r.joinHist().floor(r.joinEpoch) {
-		return
+	if _, err := r.replicateAs(&roomLog{owner: p.owner, header: p.header, ctl: true, past: true}); err != nil && r.ctx.Err() == nil {
+		r.emit(Event{Kind: CatchingUp, Err: fmt.Errorf("%w: %w", ErrCatchUp, err)})
 	}
-	l, err := r.replicate(p.owner, p.header, true, 0)
-	if err != nil {
-		if r.ctx.Err() == nil {
-			r.emit(Event{Kind: CatchingUp, Err: fmt.Errorf("%w: %w", ErrCatchUp, err)})
-		}
-		return
-	}
-	r.logMu.Lock()
-	l.past = true
-	r.logMu.Unlock()
 }
 
 // pastRead reports whether every control log that History needs for epoch e has been followed and read to its end: each
@@ -204,15 +210,10 @@ func (r *Room) pastRead(e uint64) bool {
 		}
 	}
 	for _, p := range prevs {
-		if p.epoch <= e || p.epoch <= r.joinHist().floor(r.joinEpoch) {
+		if p.epoch <= e {
 			continue
 		}
-		hd, err := kololog.DecodeLogHeader(p.header)
-		if err != nil {
-			continue
-		}
-		l := r.logs[keyOf(p.owner, hd.LogID)]
-		if l == nil || !l.done || l.applied < l.view.Len() {
+		if l := r.logs[p.key()]; l == nil || !l.done || l.applied < l.view.Len() {
 			return false
 		}
 	}
@@ -220,15 +221,15 @@ func (r *Room) pastRead(e uint64) bool {
 }
 
 // pastOpen remembers a segment of an epoch before the join that the policy lets this device read.
-func (r *Room) pastOpen(l *roomLog, i uint64, rec *ctlRecord) {
+func (r *Room) pastOpen(l *roomLog, rec *ctlRecord) {
 	if rec.Epoch < r.joinHist().floor(r.joinEpoch) {
 		return
 	}
 	hd, err := kololog.DecodeLogHeader(rec.Header)
-	if err != nil {
+	if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) {
 		return
 	}
-	s := &pastSeg{ref: objRef{l, i}, id: hd.LogID}
+	s := &pastSeg{owner: l.owner, header: bytes.Clone(rec.Header)}
 	r.hmu.Lock()
 	defer r.hmu.Unlock()
 	k := keyOf(l.owner, hd.LogID)
@@ -244,14 +245,17 @@ func (r *Room) pastOpen(l *roomLog, i uint64, rec *ctlRecord) {
 
 // pastClose records the final size of a segment that pastOpen knows. The close of the last segment of an epoch is in the
 // admin's control log of the next epoch, which a joiner reads before the log that opened the segment, so a close of a
-// segment not known yet is kept for it, up to MaxLogs of them.
+// segment not known yet and not followed is kept for it, up to MaxLogs of them.
 func (r *Room) pastClose(l *roomLog, rec *ctlRecord) {
+	k := keyOf(l.owner, rec.ID)
+	r.logMu.Lock()
+	_, followed := r.logs[k]
+	r.logMu.Unlock()
 	r.hmu.Lock()
 	defer r.hmu.Unlock()
-	k := keyOf(l.owner, rec.ID)
 	if s := r.pastBy[k]; s != nil {
 		s.closed, s.size = true, rec.Size
-	} else if len(r.early) < r.n.limits.MaxLogs {
+	} else if !followed && len(r.early) < r.n.limits.MaxLogs {
 		r.early[k] = rec.Size
 	}
 }
@@ -392,14 +396,6 @@ func (r *Room) History(ctx context.Context, before MessageID, n int) ([]Event, e
 	}
 	floor := r.joinHist().floor(r.joinEpoch)
 	if r.hbound > floor {
-		if !r.wantPast.Swap(true) {
-			r.hmu.Lock()
-			prevs := slices.Clone(r.prevs)
-			r.hmu.Unlock()
-			for _, p := range prevs {
-				r.followPrev(p)
-			}
-		}
 		r.waitUntil(ctx, r.controlRead)
 	}
 	var loadErr error
@@ -426,6 +422,15 @@ func (r *Room) History(ctx context.Context, before MessageID, n int) ([]Event, e
 
 // loadEpoch reads the messages of the segments that admins wrote in epoch e, which is before this device joined.
 func (r *Room) loadEpoch(ctx context.Context, e uint64) ([]Event, error) {
+	r.needPast.Store(e + 1)
+	r.hmu.Lock()
+	prevs := slices.Clone(r.prevs)
+	r.hmu.Unlock()
+	for _, p := range prevs {
+		if p.epoch > e {
+			r.followPrev(p)
+		}
+	}
 	r.waitUntil(ctx, func() bool { return r.pastRead(e) })
 	if err := r.deriveBack(ctx, e); err != nil {
 		return nil, err
@@ -447,16 +452,7 @@ func (r *Room) loadEpoch(ctx context.Context, e uint64) ([]Event, error) {
 	}()
 	var out []Event
 	for _, s := range closes {
-		b, err := s.ref.l.view.Get(s.ref.i)
-		var rec *ctlRecord
-		if err == nil {
-			rec, err = decodeCtl(b, r.n.limits.MaxMessageSize)
-		}
-		if err != nil {
-			out = append(out, r.entryError(s.ref.l, s.ref.i, MessageID(sha256Of(b)), nil, e, err))
-			continue
-		}
-		l, err := r.replicate(s.ref.l.owner, rec.Header, false, e)
+		l, err := r.replicate(s.owner, s.header, false, e)
 		if err != nil {
 			return nil, err
 		}

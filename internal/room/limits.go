@@ -23,7 +23,7 @@ type Limits struct {
 
 	SegmentEntries int           // entries a segment log holds before the next one opens
 	KeepSegments   int           // closed segments a device keeps and serves for each room
-	MaxLogs        int           // logs a room follows: the control logs and segments of its admins
+	MaxLogs        int           // replicas a room follows of its admins' logs; the device's own logs do not count
 	PinGap         time.Duration // least time between two pushes of a log to the pins
 	PinTTL         time.Duration // how long a capability for the pins lasts
 	PinWait        time.Duration // how long a device that is not caught up waits for its peers before it asks the pins

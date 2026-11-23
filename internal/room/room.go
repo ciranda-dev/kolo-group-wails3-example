@@ -203,7 +203,7 @@ type Room struct {
 	pastBy   map[logKey]*pastSeg
 	prevs    []prevLog         // the control logs that came before the ones followed
 	early    map[logKey]uint64 // the final sizes of segments closed before a log that opened them was read
-	wantPast atomic.Bool       // History has asked for the epochs before the join
+	needPast atomic.Uint64     // one past the epoch History is loading, 0 before it loads one
 
 	histMu   sync.Mutex // serializes History and guards what follows
 	hbound   uint64     // the epochs from it up are loaded
