@@ -578,14 +578,16 @@ func (r *Room) publish(ctx context.Context, mk func(seq uint64) ([]byte, error))
 	if err != nil {
 		return MessageID{}, err
 	}
-	id, err := r.gr.Publish(ctx, body)
+	m, err := r.gr.Publish(ctx, body)
 	switch {
 	case errors.Is(err, kologossip.ErrTooLarge):
 		return MessageID{}, fmt.Errorf("%w: %w", ErrTooLarge, err)
 	case errors.Is(err, kologossip.ErrNotJoined), errors.Is(err, kologossip.ErrClosed):
 		return MessageID{}, ErrClosed
+	case err != nil:
+		return MessageID{}, err
 	}
-	return id, err
+	return m.ID, nil
 }
 
 // Send posts a message, as a reply when replyTo is not zero. It returns once the message is sent; the message shows in

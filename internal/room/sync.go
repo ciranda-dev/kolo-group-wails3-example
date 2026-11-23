@@ -68,10 +68,10 @@ func (r *Room) followEvents() {
 			return
 		}
 		switch ev.Kind {
-		case kolosync.Grew:
+		case kolosync.FollowGrew:
 			r.moved()
 			r.kick()
-		case kolosync.Diverged:
+		case kolosync.FollowDiverged:
 			r.emit(Event{Kind: CatchingUp, Err: fmt.Errorf("%w: a log of device %x holds two histories: %w", ErrCatchUp, ev.Owner[:4], ev.Err)})
 		}
 	}
