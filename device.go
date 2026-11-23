@@ -66,14 +66,11 @@ type device struct {
 	inflight sync.WaitGroup // calls that create or join a room, which Close waits for before it closes the node
 
 	mu       sync.Mutex
-	peers    map[[32]byte]int // connections by remote device key
-	netErr   error            // why the entry nodes could not be reached, nil once one answered
+	netErr   error // why the entry nodes could not be reached, nil once one answered
 	online   bool
 	relays   []RelayState // the configured relays, in order
 	relaySeq uint64
 	watched  map[room.GroupID]bool
-	readers  map[room.GroupID]bool // rooms joined with a read link, which a restart does not keep
-	gone     map[room.GroupID]bool // rooms this device was removed from or left: the node still lists them
 	closed   bool
 }
 
@@ -83,7 +80,7 @@ func openDevice(ctx context.Context, set settings, emit func(string, any), tune 
 	if err := checkDataDir(set.DataDir); err != nil {
 		return nil, err
 	}
-	d = &device{set: set, emit: emit, peers: map[[32]byte]int{}, watched: map[room.GroupID]bool{}, readers: map[room.GroupID]bool{}, gone: map[room.GroupID]bool{}}
+	d = &device{set: set, emit: emit, watched: map[room.GroupID]bool{}}
 	if d.emit == nil {
 		d.emit = func(string, any) {}
 	}
@@ -181,7 +178,7 @@ func (d *device) setNet(err error) {
 	d.mu.Unlock()
 }
 
-// serve gives every connection of the swarm to the room node, and keeps count of the devices connected.
+// serve gives every connection of the swarm to the room node.
 func (d *device) serve() {
 	for {
 		ev, err := d.sw.Next(d.ctx)
@@ -190,17 +187,7 @@ func (d *device) serve() {
 		}
 		switch ev.Kind {
 		case koloswarm.Connected:
-			d.mu.Lock()
-			d.peers[[32]byte(ev.PublicKey)]++
-			d.mu.Unlock()
 			d.wg.Go(func() { d.node.ServeConn(d.ctx, ev.Peer.Conn(), ev.Peer.Outbound()) })
-		case koloswarm.Lost:
-			d.mu.Lock()
-			k := [32]byte(ev.PublicKey)
-			if d.peers[k]--; d.peers[k] <= 0 {
-				delete(d.peers, k)
-			}
-			d.mu.Unlock()
 		case koloswarm.RelayChanged:
 			d.relayChanged(ev)
 		}
@@ -220,16 +207,10 @@ func (d *device) watch(r *room.Room) {
 	d.wg.Go(func() {
 		for {
 			ev, err := r.Next(d.ctx)
-			if errors.Is(err, room.ErrRemoved) {
-				d.markGone(id)
-			}
 			if err != nil {
 				return
 			}
-			d.deliver(id, ev)
-			if ev.Kind == room.Removed {
-				d.markGone(id)
-			}
+			d.deliver(r, ev)
 		}
 	})
 }
@@ -239,20 +220,6 @@ func (d *device) roomNode() *room.Node {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.node
-}
-
-// markGone records that this device is no longer in the room.
-func (d *device) markGone(id room.GroupID) {
-	d.mu.Lock()
-	d.gone[id] = true
-	d.mu.Unlock()
-}
-
-// Peers returns how many devices are connected.
-func (d *device) Peers() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return len(d.peers)
 }
 
 // netStatus says whether an entry node answered, and why not when none did.
@@ -370,12 +337,9 @@ func loadCert(path string, person, dev *koloid.Identity) (*koloid.DeviceCert, er
 
 // deliver keeps what a room tells and tells the window. A room joined with a read link is not kept across a restart, so
 // its messages are not either.
-func (d *device) deliver(id room.GroupID, ev room.Event) {
-	out := eventInfo(id, ev, d.person.PublicKey())
-	d.mu.Lock()
-	reader := d.readers[id]
-	d.mu.Unlock()
-	if !reader {
+func (d *device) deliver(r *room.Room, ev room.Event) {
+	out := eventInfo(r.ID(), ev, d.person.PublicKey())
+	if !r.Reader() {
 		var err error
 		switch {
 		case ev.Kind == room.Message && ev.Err == nil:

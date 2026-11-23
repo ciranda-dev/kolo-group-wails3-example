@@ -30,9 +30,7 @@ func (d *device) info() AppInfo {
 func (d *device) rooms() []RoomInfo {
 	out := []RoomInfo{}
 	for _, r := range d.node.Rooms() {
-		if !d.isGone(r.ID()) {
-			out = append(out, d.roomInfo(r))
-		}
+		out = append(out, d.roomInfo(r))
 	}
 	slices.SortFunc(out, func(a, b RoomInfo) int {
 		if a.Name != b.Name {
@@ -73,23 +71,12 @@ func (d *device) room(id string) (*room.Room, error) {
 	if err != nil || len(b) != len(room.GroupID{}) {
 		return nil, errors.New("kolo-group: a room id is 64 hex characters")
 	}
-	if d.isGone(room.GroupID(b)) {
-		return nil, room.ErrRemoved
-	}
 	return d.node.Room(room.GroupID(b))
-}
-
-func (d *device) isGone(id room.GroupID) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.gone[id]
 }
 
 func (d *device) roomInfo(r *room.Room) RoomInfo {
 	id := r.ID()
-	d.mu.Lock()
-	reader := d.readers[id]
-	d.mu.Unlock()
+	reader := r.Reader()
 	members := r.Members()
 	pol := r.Policy()
 	info := RoomInfo{ID: hex.EncodeToString(id[:]), Name: r.Name(), Epoch: r.Status().Epoch, Members: len(members), Reader: reader, Policy: policyInfo(pol)}
@@ -168,9 +155,7 @@ func (d *device) policy(r *room.Room, in PolicyInfo) (room.Policy, error) {
 	case "all", "":
 	case "since":
 		p.History, p.Since = room.SinceEpoch, in.Since
-		if p.Since == 0 && r != nil {
-			p.Since = r.Status().Epoch + 1
-		}
+		p.SinceCommit = p.Since == 0 && r != nil
 	case "none":
 		p.History = room.NoHistory
 	default:

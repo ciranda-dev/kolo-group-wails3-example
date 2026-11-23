@@ -320,9 +320,6 @@ func (s *GroupService) JoinLink(link string) (info RoomInfo, err error) {
 		if err != nil {
 			return err
 		}
-		d.mu.Lock()
-		d.readers[r.ID()] = true
-		d.mu.Unlock()
 		d.watch(r)
 		info = d.roomInfo(r)
 		return nil
@@ -423,7 +420,8 @@ func (s *GroupService) Members(roomID string, offset, n int) (MemberPage, error)
 	return d.members(r, offset, n), nil
 }
 
-// Promote makes an online member device an admin: it then writes segments and commits too.
+// Promote makes a member device an admin: it then writes segments and commits too. The offer is sent again until the
+// device answers; CancelAction ends the wait.
 func (s *GroupService) Promote(roomID, deviceKey string) error {
 	return s.roomAction(roomID, func(ctx context.Context, _ *device, r *room.Room) error {
 		key, err := parseKey(deviceKey)
@@ -458,12 +456,8 @@ func (s *GroupService) SetPolicy(roomID string, policy PolicyInfo) error {
 
 // Leave asks the admins to remove this person and stops the room on this device. It waits for an admin; CancelAction ends the wait.
 func (s *GroupService) Leave(roomID string) error {
-	return s.roomAction(roomID, func(ctx context.Context, d *device, r *room.Room) error {
-		err := r.Leave(ctx)
-		if err == nil {
-			d.markGone(r.ID())
-		}
-		return err
+	return s.roomAction(roomID, func(ctx context.Context, _ *device, r *room.Room) error {
+		return r.Leave(ctx)
 	})
 }
 
@@ -478,7 +472,7 @@ func (s *GroupService) RoomStatus(roomID string) (StatusInfo, error) {
 		return StatusInfo{}, err
 	}
 	st := r.Status()
-	out := StatusInfo{Epoch: st.Epoch, CatchingUp: st.CatchingUp, Receipts: st.Receipts, Logs: st.Logs, AdminsOnline: st.AdminsOnline, Peers: d.Peers()}
+	out := StatusInfo{Epoch: st.Epoch, CatchingUp: st.CatchingUp, Receipts: st.Receipts, Logs: st.Logs, AdminsOnline: st.AdminsOnline, Peers: st.Peers}
 	out.Online, out.NetError = d.netStatus()
 	if st.PinError != nil {
 		out.PinError = st.PinError.Error()

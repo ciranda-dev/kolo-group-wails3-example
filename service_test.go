@@ -284,6 +284,53 @@ func TestStatusAndNetwork(t *testing.T) {
 	}
 }
 
+// The devices connected that a room's status counts are the room's own, not every connection of the device.
+func TestStatusCountsTheDevicesOfTheRoom(t *testing.T) {
+	server := newServer(t)
+	a, b, c := startApp(t, server, "", nil), startApp(t, server, "", nil), startApp(t, server, "", nil)
+	one := pair(t, a, b, "One", PolicyInfo{})
+	two := pair(t, a, c, "Two", PolicyInfo{})
+	peers := func(id string) int {
+		st, err := a.svc.RoomStatus(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.Peers
+	}
+	waitFor(t, wait, "a connected to b and c", func() bool {
+		st, err := b.svc.RoomStatus(one)
+		st2, err2 := c.svc.RoomStatus(two)
+		return err == nil && err2 == nil && st.Peers == 1 && st2.Peers == 1
+	})
+	time.Sleep(time.Second)
+	if p1, p2 := peers(one), peers(two); p1 != 1 || p2 != 1 {
+		t.Fatalf("devices connected: %d in One and %d in Two, want 1 and 1", p1, p2)
+	}
+}
+
+// A device that is offline when an admin promotes it gets the offer once it is back.
+func TestPromoteADeviceThatWasOffline(t *testing.T) {
+	server := newServer(t)
+	a, b := startApp(t, server, "", nil), startApp(t, server, "", nil)
+	id := pair(t, a, b, "Later", PolicyInfo{})
+	b.stop()
+	done := make(chan error, 1)
+	go func() { done <- a.svc.Promote(id, b.info.Device) }()
+	time.Sleep(3 * time.Second)
+	b.start()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(wait):
+		a.svc.CancelAction()
+		<-done
+		t.Fatal("Promote did not reach the device once it was back")
+	}
+	waitFor(t, wait, "b to be an admin", func() bool { return roomOf(t, b, id).Admin })
+}
+
 // The pins and relays the app was started with are what Settings shows, with keys in hex.
 func TestSettingsShowPinsAndRelays(t *testing.T) {
 	server := newServer(t)
