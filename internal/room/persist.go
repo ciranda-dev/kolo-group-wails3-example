@@ -75,6 +75,7 @@ const (
 	recReceipt = "x/"
 	recObject  = "t/"
 	recWelcome = "w/" // a device whose Welcome this admin made and that has not made contact
+	recFirst   = "f/" // the first epoch a device was a leaf in, as this device saw it
 )
 
 const metaVersion = 0

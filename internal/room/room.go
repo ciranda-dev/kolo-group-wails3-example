@@ -155,6 +155,7 @@ type Room struct {
 	readKey [keySize]byte // seals the state records, with reader
 
 	ever      map[[32]byte]*kologossip.Author // every author the room has had, guarded by kmu
+	first     map[[32]byte]uint64             // the first epoch this device saw each author a leaf in, guarded by kmu
 	joinEpoch uint64
 
 	rate   *limiter
@@ -257,7 +258,7 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 		out: newLimiter(n.limits.Rate*4/5, max(1, n.limits.Burst-1)), ord: newOrderer(n.cfg.Device.PublicKey(), n.limits), seen: newIDSet(n.limits.MaxKnown), events: make(chan Event, n.limits.EventQueue),
 		adminKick: make(chan struct{}, 1), syncKick: make(chan struct{}, 1), pushKick: make(chan struct{}, 1),
 		kv: kv, logSec: sec, logs: map[logKey]*roomLog{}, dirs: map[[32]byte][]byte{}, rcpt: map[MessageID]*receipt{}, welcomed: map[[32]byte]uint64{},
-		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, badCommits: map[[32]byte]struct{}{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, joinEpoch: v.epoch,
+		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, badCommits: map[[32]byte]struct{}{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, first: map[[32]byte]uint64{}, joinEpoch: v.epoch,
 		links: map[uint64][]linkRec{}, past: map[uint64][]*pastSeg{}, pastBy: map[logKey]*pastSeg{}}
 	if readKey != nil {
 		r.reader, r.readKey = true, *readKey
@@ -361,6 +362,15 @@ func (r *Room) restore(v *view) error {
 	}); err != nil {
 		return err
 	}
+	if err := r.kv.each(recFirst, func(tail, val []byte) error {
+		if len(tail) != 32 || len(val) != 8 {
+			return fmt.Errorf("%w: first epoch record", ErrMalformed)
+		}
+		r.first[[32]byte(tail)] = unbe(val)
+		return nil
+	}); err != nil {
+		return err
+	}
 	if err := r.rememberAuthors(v); err != nil {
 		return err
 	}
@@ -379,11 +389,18 @@ func (r *Room) restore(v *view) error {
 	return r.reopenLogs()
 }
 
-// rememberAuthors keeps the authors of a view, so the messages of a device that left are still read.
+// rememberAuthors keeps the authors of a view, so the messages of a device that left are still read, and the first epoch
+// each was a leaf in.
 func (r *Room) rememberAuthors(v *view) error {
 	r.kmu.Lock()
 	defer r.kmu.Unlock()
 	for d, a := range v.authors {
+		if _, ok := r.first[d]; !ok {
+			r.first[d] = v.epoch
+			if err := r.kv.put(be(v.epoch), recFirst, d[:]); err != nil {
+				return err
+			}
+		}
 		if r.ever[d] == nil || !bytes.Equal(r.ever[d].Cert.Encode(), a.Cert.Encode()) {
 			r.ever[d] = a
 			if err := r.kv.putAuthor(d, a); err != nil {
@@ -822,7 +839,7 @@ func (r *Room) receive(m *kologossip.Message) {
 		r.emit(ev)
 		return
 	}
-	if !r.mayPostAt(r.view.Load(), s.Epoch, m.Person, m.Device) {
+	if v := r.view.Load(); !r.mayPostAt(v, s.Epoch, liveAt(v, s.Epoch, r.n.now()), m.Person, m.Device) {
 		ev.Err = ErrNotPoster
 		r.emit(ev)
 		return

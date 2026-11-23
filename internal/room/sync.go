@@ -433,7 +433,7 @@ func (r *Room) readEntry(l *roomLog, i uint64, b []byte, err error) (wait bool) 
 		}
 		return fail(id, st.Device[:], epoch, ErrWrongEpoch)
 	}
-	ev, err := r.openStored(st, &key)
+	ev, err := r.openStored(st, l.epoch, &key)
 	if err != nil {
 		return fail(id, st.Device[:], epoch, err)
 	}

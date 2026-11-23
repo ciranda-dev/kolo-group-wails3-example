@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"slices"
+	"time"
 
 	kolocodec "github.com/ciranda-dev/kolo-codec"
 	kolomls "github.com/ciranda-dev/kolo-mls"
@@ -225,17 +226,48 @@ func (r *Room) policyAt(e uint64) *roomPolicy {
 	return r.pols[0].p
 }
 
-// mayPostAt reports whether a device of person may post a message of epoch e. A message of an epoch before this device's
-// join is judged by History, which holds no policy of those epochs.
-func (r *Room) mayPostAt(v *view, e uint64, person, device []byte) bool {
+// mayPostAt reports whether a device of person may post a message of epoch e that is judged in epoch at: the device was a
+// leaf of epoch e and the policies of e and at let it post, so the key of an epoch before a restriction does not pass it. A
+// message of an epoch before this device's join is judged by History, which holds no policy of those epochs.
+func (r *Room) mayPostAt(v *view, e, at uint64, person, device []byte) bool {
 	if e < r.joinEpoch {
 		return true
 	}
-	roles := v.roles
-	if ev := v.at(e, r.n.now()); ev != nil {
-		roles = ev.roles
+	if len(device) != 32 {
+		return false
 	}
-	return r.policyAt(e).mayPost(person, device, roles)
+	r.kmu.RLock()
+	first, ok := r.first[[32]byte(device)]
+	r.kmu.RUnlock()
+	if !ok || first > e {
+		return false
+	}
+	now := r.n.now()
+	rolesAt := func(epoch uint64) *settle.Roles {
+		if ev := v.at(epoch, now); ev != nil {
+			return ev.roles
+		}
+		return v.roles
+	}
+	return r.policyAt(e).mayPost(person, device, rolesAt(e)) && r.policyAt(at).mayPost(person, device, rolesAt(at))
+}
+
+// liveAt is the epoch a message of epoch e that arrives now is judged in: its own while the view holds it (the current epoch,
+// or the previous one while its window lasts, for a message in flight), else the current one.
+func liveAt(v *view, e uint64, now time.Time) uint64 {
+	if v.at(e, now) != nil {
+		return e
+	}
+	return v.epoch
+}
+
+// storedAt is the epoch a message of epoch e that a segment of epoch at holds is judged in: its own when an admin may
+// have taken it in flight, in its epoch or the next, else the segment's.
+func storedAt(e, at uint64) uint64 {
+	if e+1 >= at {
+		return e
+	}
+	return at
 }
 
 // Policy returns the room's policy of the current epoch; a read link shows as a flag only.

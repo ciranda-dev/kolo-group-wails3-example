@@ -380,7 +380,7 @@ func (r *Room) readPast(ctx context.Context, l *roomLog, i, e uint64) (Event, er
 		key := r.keys[epoch]
 		r.kmu.RUnlock()
 		var ev Event
-		if ev, err = r.openStored(st, &key); err == nil {
+		if ev, err = r.openStored(st, e, &key); err == nil {
 			return ev, nil
 		}
 	}
@@ -427,8 +427,8 @@ func (r *Room) entryError(l *roomLog, i uint64, id MessageID, device []byte, epo
 	return Event{Kind: Message, ID: id, Device: bytes.Clone(device), Epoch: epoch, Err: fmt.Errorf("%w: entry %d of a segment of device %x: %w", ErrCatchUp, i, l.owner[:4], cause)}
 }
 
-// openStored checks a stored message against its author and opens it with the key of its epoch.
-func (r *Room) openStored(st *stored, key *[keySize]byte) (Event, error) {
+// openStored checks a stored message of a segment of epoch at against its author and opens it with the key of its epoch.
+func (r *Room) openStored(st *stored, at uint64, key *[keySize]byte) (Event, error) {
 	au := r.authorOf(st.Device)
 	if au == nil {
 		return Event{}, kologossip.ErrUnknownAuthor
@@ -436,7 +436,7 @@ func (r *Room) openStored(st *stored, key *[keySize]byte) (Event, error) {
 	if err := verifySealed(st.Device[:], r.gid[:], st.sealed, st.Seq); err != nil {
 		return Event{}, err
 	}
-	if !r.mayPostAt(r.view.Load(), st.sealed.Epoch, au.Person, st.Device[:]) {
+	if !r.mayPostAt(r.view.Load(), st.sealed.Epoch, storedAt(st.sealed.Epoch, at), au.Person, st.Device[:]) {
 		return Event{}, ErrNotPoster
 	}
 	c, err := r.openContent(key, st.sealed, st.Device[:], st.Seq)

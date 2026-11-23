@@ -78,7 +78,7 @@ func (r *Room) check(m *kologossip.Message) error {
 		if err != nil {
 			return err
 		}
-		if !r.mayPostAt(v, s.Epoch, m.Person, m.Device) {
+		if !r.mayPostAt(v, s.Epoch, liveAt(v, s.Epoch, now), m.Person, m.Device) {
 			return ErrNotPoster
 		}
 		if err := verifySealed(m.Device, r.gid[:], s, m.Seq); err != nil {

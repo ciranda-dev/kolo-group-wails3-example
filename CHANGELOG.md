@@ -64,3 +64,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - A device that an admin removes now learns that it was removed. The other members closed their connections to it as soon as they applied the Commit, often before the Commit reached it, so it never set its removed state (in a room that had passed 8 epochs this happened in 5 of 10 runs; with the delay in none of 15, `TestRemovedDeviceLearnsItWasRemoved`). The Commit itself is the signed notice; no other message is needed.
 - An admin with few kept segments (`KeepSegments`) no longer forgets a segment while it is pushed to the pins. The push took its logs out of the list of logs to push and the trim of old segments then closed one of them; the push failed and was tried again for ever, and `Status().PinError` stayed at "pin: no pinning peer accepted the log" (5 of 15 runs with `KeepSegments: 1` and two pins; `TestSegmentBeingPushedIsNotForgotten` fails on the old code every time).
+
+### Security
+
+- A post is judged by the policy of its epoch and by the current policy (or, for a stored one, by the policy of the segment that holds it), and only from a device that was a leaf of its epoch, so a member that may not post can no longer post by sealing under the key of an epoch before the restriction. A message of the previous epoch in flight is still judged by its own epoch while the window lasts; after a restart that window is gone. Each device records the first epoch it saw every author in (a new record kind).
