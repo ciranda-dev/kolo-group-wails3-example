@@ -183,6 +183,9 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 		if r.indexRecord(l, i, rec) {
 			r.poke()
 		}
+		if rec.Kind == ctlPut && isSettled(rec.Key) {
+			r.checkLateSettled(rec)
+		}
 	case ctlOpen:
 		r.logMu.Lock()
 		l.opened, l.openedTo = true, max(l.openedTo, rec.Epoch)
@@ -321,6 +324,7 @@ func (r *Room) advanceOnce() bool {
 			r.reportEpoch(e, h, ErrCommitRef)
 			continue
 		}
+		r.sawSettled(e, st.TBS.Commit)
 		if r.isBad(st.TBS.Commit) {
 			continue
 		}
@@ -354,6 +358,52 @@ func (r *Room) advanceOnce() bool {
 		return true
 	}
 	return false
+}
+
+// seenCommit is the Commit a quorum of settlers signed for an epoch.
+type seenCommit struct {
+	hash     [32]byte
+	reported bool
+}
+
+// sawSettled takes note of a Commit that a quorum signed for epoch, and reports, once for the epoch, a second one: the
+// settlers forked the room, and each part of it may apply another Commit.
+func (r *Room) sawSettled(epoch uint64, hash [32]byte) {
+	r.mu.Lock()
+	for e := range r.settledIn {
+		if e+1 < epoch {
+			delete(r.settledIn, e)
+		}
+	}
+	s := r.settledIn[epoch]
+	fork := s != nil && s.hash != hash && !s.reported
+	switch {
+	case s == nil:
+		r.settledIn[epoch] = &seenCommit{hash: hash}
+	case fork:
+		s.reported = true
+	}
+	r.mu.Unlock()
+	if fork && r.ctx.Err() == nil {
+		r.emit(Event{Kind: CatchingUp, Epoch: epoch, Err: fmt.Errorf("%w: epoch %d has the Commits %x and %x", ErrEquivocation, epoch, s.hash[:4], hash[:4])})
+	}
+}
+
+// checkLateSettled takes note of a SettledCommit a control log holds for the epoch before the current one, if its quorum
+// holds, so a second Commit settled for an epoch this device has left is reported too.
+func (r *Room) checkLateSettled(rec *ctlRecord) {
+	v := r.view.Load()
+	p := v.prev
+	if p == nil || rec.Key != settle.SettledKey(r.gid[:], p.epoch) || len(rec.Value) > settledBound(len(p.roles.Settlers)) {
+		return
+	}
+	st, err := settle.DecodeSettled(rec.Value, len(p.roles.Settlers))
+	if err != nil || !bytes.Equal(st.TBS.GroupID, r.gid[:]) || st.TBS.Epoch != p.epoch || st.TBS.Braid != p.roles.Braid {
+		return
+	}
+	if st.Valid(p.roles, func(d [32]byte) bool { return p.author(d) != nil }) >= p.roles.Q() {
+		r.sawSettled(p.epoch, st.TBS.Commit)
+	}
 }
 
 func (r *Room) isBad(hash [32]byte) bool {

@@ -52,6 +52,9 @@ func (r *Room) adminLoop() {
 		}
 		r.mu.Unlock()
 		if ap != nil {
+			if st, err := settle.DecodeSettled(ap.Settled, 0); err == nil {
+				r.sawSettled(ap.Epoch, st.TBS.Commit)
+			}
 			r.announce(ap)
 			r.applied(evs)
 		}

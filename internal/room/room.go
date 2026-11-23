@@ -179,8 +179,9 @@ type Room struct {
 	bp         atomic.Pointer[kolobraid.Braid] // b, for readers that must not take mu
 	pins       settle.Pins
 	adminKick  chan struct{}
-	stepErr    error                 // guarded by mu
-	badCommits map[[32]byte]struct{} // the Commits and SettledCommits of this epoch reported as unusable, guarded by mu
+	stepErr    error                  // guarded by mu
+	badCommits map[[32]byte]struct{}  // the Commits and SettledCommits of this epoch reported as unusable, guarded by mu
+	settledIn  map[uint64]*seenCommit // the Commit a quorum settled for each recent epoch, guarded by mu
 
 	kv       roomKV
 	logSec   *kololog.EntrySecret
@@ -258,7 +259,7 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 		out: newLimiter(n.limits.Rate*4/5, max(1, n.limits.Burst-1)), ord: newOrderer(n.cfg.Device.PublicKey(), n.limits), seen: newIDSet(n.limits.MaxKnown), events: make(chan Event, n.limits.EventQueue),
 		adminKick: make(chan struct{}, 1), syncKick: make(chan struct{}, 1), pushKick: make(chan struct{}, 1),
 		kv: kv, logSec: sec, logs: map[logKey]*roomLog{}, dirs: map[[32]byte][]byte{}, rcpt: map[MessageID]*receipt{}, welcomed: map[[32]byte]uint64{},
-		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, badCommits: map[[32]byte]struct{}{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, first: map[[32]byte]uint64{}, joinEpoch: v.epoch,
+		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, badCommits: map[[32]byte]struct{}{}, settledIn: map[uint64]*seenCommit{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, first: map[[32]byte]uint64{}, joinEpoch: v.epoch,
 		links: map[uint64][]linkRec{}, past: map[uint64][]*pastSeg{}, pastBy: map[logKey]*pastSeg{}}
 	if readKey != nil {
 		r.reader, r.readKey = true, *readKey
@@ -854,7 +855,8 @@ func (r *Room) receive(m *kologossip.Message) {
 	r.release(func() []Event { return r.ord.add(ev, r.n.now()) })
 }
 
-// hintCommit keeps the SettledCommit of an announced Commit for the sync loop, which pulls the Commit by its hash.
+// hintCommit keeps the SettledCommit of an announced Commit for the sync loop, which pulls the Commit by its hash. The
+// validator has checked its quorum.
 func (r *Room) hintCommit(m *kologossip.Message) {
 	c, err := decodeCommitRef(m.Body)
 	if err != nil {
@@ -864,6 +866,7 @@ func (r *Room) hintCommit(m *kologossip.Message) {
 	if err != nil {
 		return
 	}
+	r.sawSettled(st.TBS.Epoch, st.TBS.Commit)
 	r.hint.Store(&hint{epoch: st.TBS.Epoch, settled: c.Settled})
 	r.kick()
 }

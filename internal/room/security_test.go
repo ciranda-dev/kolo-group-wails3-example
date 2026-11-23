@@ -139,3 +139,32 @@ func errEvents(rec *recorder) (out []Event) {
 	}
 	return out
 }
+
+// A second Commit that the settlers settle for an epoch is reported with ErrEquivocation.
+func TestSecondSettledCommitOfAnEpochIsReported(t *testing.T) {
+	gr := newGroup(t, 2, Limits{})
+	gr.waitMesh(1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	admin := gr.rooms[0]
+	e := admin.Status().Epoch
+	var other [32]byte
+	rand.Read(other[:])
+	tbs := settle.TBS{GroupID: admin.gid[:], Epoch: e, Commit: other, Braid: admin.view.Load().roles.Braid}
+	sig, err := gr.nodes[0].dev.Sign(settle.SettledContext, tbs.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := &settle.Settled{TBS: tbs, Shares: []settle.Share{{Signer: [32]byte(gr.nodes[0].key()), Signature: [64]byte(sig)}}}
+	if err := admin.SetPolicy(ctx, Policy{AdminsPost: true}); err != nil {
+		t.Fatal(err)
+	}
+	gr.waitEpoch(e + 1)
+	if err := admin.appendCtl(&ctlRecord{Kind: ctlPut, Key: settle.SettledKey(admin.gid[:], e), Value: forged.Encode()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 20*time.Second, "a report", func() bool { return len(errEvents(gr.recs[1])) > 0 })
+	if !hasErr(gr.recs[1], ErrEquivocation) {
+		t.Fatalf("reports: %v", errEvents(gr.recs[1]))
+	}
+}
