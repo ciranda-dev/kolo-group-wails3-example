@@ -77,7 +77,7 @@ func Open(ctx context.Context, cfg *Config) (*Node, error) {
 		n.now = time.Now
 	}
 	n.members.Store(&map[[32]byte]struct{}{})
-	n.sync = kolosync.NewServer(func(peer, owner ed25519.PublicKey, id kololog.LogID) kolosync.Access {
+	n.sync, err = kolosync.NewServerWith(func(peer, owner ed25519.PublicKey, id kololog.LogID) kolosync.Access {
 		if len(owner) != ed25519.PublicKeySize || len(peer) != ed25519.PublicKeySize {
 			return kolosync.NoAccess
 		}
@@ -86,7 +86,10 @@ func Open(ctx context.Context, cfg *Config) (*Node, error) {
 			return kolosync.Ciphertext
 		}
 		return kolosync.NoAccess
-	})
+	}, &kolosync.ServerOptions{PeerBytesPerSecond: lim.PeerBytesPerSecond, PeerBurstBytes: lim.PeerBurstBytes})
+	if err != nil {
+		return nil, errInvalid("the peer byte budget: %v", err)
+	}
 	if err := n.reopen(ctx); err != nil {
 		n.Close()
 		return nil, err

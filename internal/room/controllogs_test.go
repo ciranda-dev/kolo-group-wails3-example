@@ -10,6 +10,7 @@ import (
 	kologossip "github.com/ciranda-dev/kolo-gossip"
 	kololog "github.com/ciranda-dev/kolo-log"
 	kolostore "github.com/ciranda-dev/kolo-store"
+	kolosync "github.com/ciranda-dev/kolo-sync"
 )
 
 func logCount(r *Room) int {
@@ -330,6 +331,53 @@ func TestFarEpochSegmentIsRefused(t *testing.T) {
 	m.logMu.Unlock()
 	if followed || !hasErr(gr.recs[1], ErrWrongEpoch) || m.Status().CatchingUp {
 		t.Fatalf("a segment of epoch 2^40: followed %v, reported %v, catching up %v", followed, hasErr(gr.recs[1], ErrWrongEpoch), m.Status().CatchingUp)
+	}
+}
+
+// A member that pulls more than its byte budget from a node is answered busy.
+func TestMemberPullingPastItsBudgetIsBusy(t *testing.T) {
+	server := newServer(t)
+	lim := Limits{PeerBytesPerSecond: 1, PeerBurstBytes: 2 * kolosync.MaxMessageSize}
+	x := newTNode(t, tnodeOpts{server: server, limits: lim})
+	y := newTNode(t, tnodeOpts{server: server, limits: lim})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	admin, err := x.n.Create(ctx, "budget", Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := admin.Add(ctx, kpOf(t, y))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := y.n.Join(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 30*time.Second, "the member connected to the admin", func() bool { return y.n.syncConn(x.key()) != nil })
+	l, err := admin.openLog(false, admin.Status().Epoch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 1<<20)
+	for range 10 {
+		if _, err := l.log.Append(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	admin.logMu.Lock()
+	err = admin.trackLocked(l)
+	admin.logMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := kolostore.New(kolostore.NewMemory()).OpenReplica(x.key(), l.id, l.header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rep.Close()
+	err = kolosync.PullCiphertext(ctx, y.n.syncConn(x.key()), rep)
+	if !errors.Is(err, kolosync.ErrBusy) {
+		t.Fatalf("a pull of %d MiB with a burst of %d MiB: %v with %d of 10 entries, want ErrBusy", 10, 2*kolosync.MaxMessageSize>>20, err, rep.Len())
 	}
 }
 
