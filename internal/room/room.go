@@ -148,8 +148,9 @@ type Room struct {
 
 	kmu  sync.RWMutex
 	keys map[uint64][keySize]byte
-	lo   uint64   // the oldest epoch in keys, guarded by kmu
-	pols []polRec // the policy of each epoch it changed in, guarded by kmu
+	alts map[uint64][][keySize]byte // other keys that history links gave for an epoch, guarded by kmu
+	lo   uint64                     // the oldest epoch in keys, guarded by kmu
+	pols []polRec                   // the policy of each epoch it changed in, guarded by kmu
 
 	reader  bool          // a room joined with a read link: no MLS member, only the epoch keys of the link's records
 	readKey [keySize]byte // seals the state records, with reader
@@ -200,11 +201,12 @@ type Room struct {
 	past   map[uint64][]*pastSeg
 	pastBy map[logKey]*pastSeg
 
-	histMu sync.Mutex // serializes History and guards what follows
-	hbound uint64     // the epochs from it up are loaded
-	hbuf   []Event    // loaded and not returned yet, oldest first
-	hlast  MessageID  // the oldest message of the last page
-	hseen  *idSet
+	histMu   sync.Mutex // serializes History and guards what follows
+	hbound   uint64     // the epochs from it up are loaded
+	hbuf     []Event    // loaded and not returned yet, oldest first
+	hlast    MessageID  // the oldest message of the last page
+	hseen    *idSet
+	hreports []Event // reports of the links for the next page
 
 	wmu      sync.Mutex
 	welcomed map[[32]byte]uint64 // the devices this admin added that have not made contact, with the epoch of their Welcome
@@ -255,7 +257,7 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 		kv = newRoomKV(kolostore.NewMemory(), gid)
 	}
 	r := &Room{n: n, gid: gid, name: name, secret: secret, self: n.cfg.Device.PublicKey(), m: m,
-		gone: make(chan struct{}), keys: map[uint64][keySize]byte{v.epoch: v.key}, rate: newLimiter(n.limits.Rate, n.limits.Burst),
+		gone: make(chan struct{}), keys: map[uint64][keySize]byte{v.epoch: v.key}, alts: map[uint64][][keySize]byte{}, rate: newLimiter(n.limits.Rate, n.limits.Burst),
 		out: newLimiter(n.limits.Rate*4/5, max(1, n.limits.Burst-1)), ord: newOrderer(n.cfg.Device.PublicKey(), n.limits), seen: newIDSet(n.limits.MaxKnown), events: make(chan Event, n.limits.EventQueue),
 		adminKick: make(chan struct{}, 1), syncKick: make(chan struct{}, 1), pushKick: make(chan struct{}, 1),
 		kv: kv, logSec: sec, logs: map[logKey]*roomLog{}, dirs: map[[32]byte][]byte{}, rcpt: map[MessageID]*receipt{}, welcomed: map[[32]byte]uint64{},
@@ -328,6 +330,17 @@ func (r *Room) restore(v *view) error {
 			return fmt.Errorf("%w: epoch key record", ErrMalformed)
 		}
 		r.keys[unbe(tail)] = [keySize]byte(val)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := r.kv.each(recAlt, func(tail, val []byte) error {
+		if len(tail) != 8 || len(val) == 0 || len(val)%keySize != 0 {
+			return fmt.Errorf("%w: key record", ErrMalformed)
+		}
+		for k := range slices.Chunk(val, keySize) {
+			r.alts[unbe(tail)] = append(r.alts[unbe(tail)], [keySize]byte(k))
+		}
 		return nil
 	}); err != nil {
 		return err

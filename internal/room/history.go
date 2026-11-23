@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	kolocodec "github.com/ciranda-dev/kolo-codec"
@@ -202,7 +203,26 @@ func (r *Room) waitUntil(ctx context.Context, cond func() bool) bool {
 	return true
 }
 
-// deriveBack opens the links down to the key of epoch target and keeps each key it derives, in one write.
+// keysOf returns the keys of epoch e: the one in keys, then the other keys that links gave for it.
+func (r *Room) keysOf(e uint64) [][keySize]byte {
+	r.kmu.RLock()
+	defer r.kmu.RUnlock()
+	k, ok := r.keys[e]
+	if !ok {
+		return nil
+	}
+	return append([][keySize]byte{k}, r.alts[e]...)
+}
+
+// derived is a key that links of an epoch give for the epoch before, and the admins whose links give it.
+type derived struct {
+	key    [keySize]byte
+	owners [][32]byte
+}
+
+// deriveBack opens the links down to the key of epoch target and keeps each key it derives, in one write. An admin of an
+// epoch can write a link that opens to a wrong key, so every key the links give is kept, the one most links agree on first,
+// and a message is opened with each; a disagreement is reported in the next page of History.
 func (r *Room) deriveBack(ctx context.Context, target uint64) (err error) {
 	r.kmu.RLock()
 	lo := r.lo
@@ -215,7 +235,6 @@ func (r *Room) deriveBack(ctx context.Context, target uint64) (err error) {
 	for {
 		r.kmu.RLock()
 		lo := r.lo
-		key := r.keys[lo]
 		r.kmu.RUnlock()
 		if lo <= target {
 			return nil
@@ -233,20 +252,46 @@ func (r *Room) deriveBack(ctx context.Context, target uint64) (err error) {
 			}
 			return fmt.Errorf("%w: no link of epoch %d", ErrHistory, lo)
 		}
-		var prev [keySize]byte
+		var got []*derived
 		var oerr error
 		for _, c := range cands {
-			if prev, oerr = openLink(r.gid[:], lo, &key, c.link[:]); oerr == nil {
+			for _, k := range r.keysOf(lo) {
+				prev, err := openLink(r.gid[:], lo, &k, c.link[:])
+				if err != nil {
+					oerr = err
+					continue
+				}
+				i := slices.IndexFunc(got, func(d *derived) bool { return d.key == prev })
+				if i < 0 {
+					got = append(got, &derived{key: prev})
+					i = len(got) - 1
+				}
+				got[i].owners = append(got[i].owners, c.owner)
 				break
 			}
 		}
-		if oerr != nil {
+		if len(got) == 0 {
 			return fmt.Errorf("%w: the link of epoch %d does not open: %w", ErrHistory, lo, oerr)
 		}
-		bt.Put(r.kv.key(recKey, epochKeyName(lo-1)), prev[:])
+		slices.SortStableFunc(got, func(a, b *derived) int { return len(b.owners) - len(a.owners) })
+		var alts []byte
 		r.kmu.Lock()
-		r.keys[lo-1], r.lo = prev, lo-1
+		r.keys[lo-1], r.lo = got[0].key, lo-1
+		for _, d := range got[1:] {
+			r.alts[lo-1] = append(r.alts[lo-1], d.key)
+			alts = append(alts, d.key[:]...)
+		}
 		r.kmu.Unlock()
+		bt.Put(r.kv.key(recKey, epochKeyName(lo-1)), got[0].key[:])
+		if len(got) > 1 {
+			bt.Put(r.kv.key(recAlt, epochKeyName(lo-1)), alts)
+			var who []string
+			for _, d := range got {
+				who = append(who, fmt.Sprintf("%x", d.owners[0][:4]))
+			}
+			r.hreports = append(r.hreports, Event{Kind: Message, Epoch: lo - 1, ID: MessageID(sha256Of(append(epochKeyName(lo), r.gid[:]...))),
+				Err: fmt.Errorf("%w: the links of epoch %d give %d keys for epoch %d (devices %s); each is tried", ErrLink, lo, len(got), lo-1, strings.Join(who, ", "))})
+		}
 	}
 }
 
@@ -285,6 +330,8 @@ func (r *Room) History(ctx context.Context, before MessageID, n int) ([]Event, e
 		r.hbuf = append(evs, r.hbuf...)
 		r.hbound--
 	}
+	r.hbuf = append(r.hreports, r.hbuf...)
+	r.hreports = nil
 	if len(r.hbuf) == 0 {
 		return nil, loadErr
 	}
@@ -376,12 +423,11 @@ func (r *Room) readPast(ctx context.Context, l *roomLog, i, e uint64) (Event, er
 	if epoch > e || epoch < r.joinHist().floor(r.joinEpoch) {
 		err = ErrWrongEpoch
 	} else if err = r.deriveBack(ctx, epoch); err == nil {
-		r.kmu.RLock()
-		key := r.keys[epoch]
-		r.kmu.RUnlock()
-		var ev Event
-		if ev, err = r.openStored(st, e, &key); err == nil {
-			return ev, nil
+		for _, key := range r.keysOf(epoch) {
+			var ev Event
+			if ev, err = r.openStored(st, e, &key); err == nil {
+				return ev, nil
+			}
 		}
 	}
 	return r.entryError(l, i, id, st.Device[:], epoch, err), err

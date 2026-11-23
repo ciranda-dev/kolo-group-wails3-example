@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -192,4 +193,70 @@ func TestFarEpochEntryIsReportedAndTheSegmentGoesOn(t *testing.T) {
 	waitFor(t, 30*time.Second, "the message after the far entry", func() bool { return gr.recs[1].has("after") })
 	waitFor(t, 10*time.Second, "the report", func() bool { return hasErr(gr.recs[1], ErrWrongEpoch) })
 	waitFor(t, 10*time.Second, "the end of the catch-up", func() bool { return !r.Status().CatchingUp })
+}
+
+// A history link that opens to a wrong key does not end History: every key the links give is tried, and the disagreement
+// is reported.
+func TestWrongHistoryLinkDoesNotHideTheHonestOne(t *testing.T) {
+	gr := newGroup(t, 2, Limits{CatchUpWait: 5 * time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	sent := gr.advance(t, ctx, 3, "old")
+	late := gr.newNode()
+	gr.join(ctx, late)
+	r := gr.rooms[2]
+	je := r.joinEpoch
+	waitFor(t, 30*time.Second, "the link of the join epoch", func() bool {
+		r.hmu.Lock()
+		defer r.hmu.Unlock()
+		return len(r.links[je]) > 0
+	})
+	r.kmu.RLock()
+	key := r.keys[je]
+	r.kmu.RUnlock()
+	var fake [keySize]byte
+	rand.Read(fake[:])
+	bad, err := sealLink(r.gid[:], je, &key, &fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owner [32]byte
+	rand.Read(owner[:])
+	r.hmu.Lock()
+	r.links[je] = append([]linkRec{{owner: owner, link: [linkSize]byte(bad)}}, r.links[je]...)
+	r.hmu.Unlock()
+	evs, err := r.History(ctx, MessageID{}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shown, reported := 0, false
+	for _, ev := range evs {
+		switch {
+		case errors.Is(ev.Err, ErrLink):
+			reported = true
+		case ev.Err != nil:
+			t.Errorf("history entry: %v", ev.Err)
+		case strings.HasPrefix(string(ev.Body), "old"):
+			shown++
+		}
+	}
+	if shown != len(sent) || !reported {
+		t.Fatalf("%d of %d old messages shown, the wrong link reported: %v", shown, len(sent), reported)
+	}
+	r = gr.restart(2)
+	if got := len(r.keysOf(je - 1)); got != 2 {
+		t.Fatalf("after a restart the room holds %d keys of epoch %d", got, je-1)
+	}
+	if evs, err = r.History(ctx, MessageID{}, 100); err != nil {
+		t.Fatal(err)
+	}
+	shown = 0
+	for _, ev := range evs {
+		if ev.Err == nil && strings.HasPrefix(string(ev.Body), "old") {
+			shown++
+		}
+	}
+	if shown != len(sent) {
+		t.Fatalf("after a restart %d of %d old messages shown", shown, len(sent))
+	}
 }
