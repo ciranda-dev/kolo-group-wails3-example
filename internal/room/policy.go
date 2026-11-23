@@ -139,6 +139,8 @@ func (p Policy) build(prev *roomPolicy) (*roomPolicy, error) {
 		return nil, errInvalid("history rule %d", p.History)
 	case p.History != SinceEpoch && p.Since != 0:
 		return nil, errInvalid("an epoch with a rule that has none")
+	case p.SinceCommit && (p.History != SinceEpoch || p.Since != 0):
+		return nil, errInvalid("SinceCommit with a rule other than SinceEpoch or with an epoch")
 	}
 	rp := &roomPolicy{hist: histPolicy{Rule: p.History, Since: p.Since}, admins: p.AdminsPost, link: p.ReadLink}
 	var err error
@@ -285,6 +287,9 @@ func (r *Room) SetPolicy(ctx context.Context, p Policy) error {
 		np, err := p.build(v.pol)
 		if err != nil {
 			return nil, false, err
+		}
+		if p.SinceCommit {
+			np.hist.Since = v.epoch + 1
 		}
 		np.hist = v.pol.hist.next(np.hist, v.epoch)
 		return np, bytes.Equal(np.encode(), v.pol.encode()), nil
