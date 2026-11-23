@@ -53,15 +53,16 @@ type roomLog struct {
 	rep     *kolostore.Replica
 	deriver *kololog.KeyDeriver
 
-	closed   bool   // a segment whose writer declared its final size
-	size     uint64 // that size
-	cursor   uint64 // entries of a segment already read
-	keyed    uint64 // entries of a replica that have their keys
-	applied  uint64 // entries of a control log already applied
-	since    time.Time
-	reported bool
-	opened   bool   // a control log that has opened a segment
-	openedTo uint64 // the newest epoch it opened one for
+	closed      bool   // a segment whose writer declared its final size
+	size        uint64 // that size
+	cursor      uint64 // entries of a segment already read
+	keyed       uint64 // entries of a replica that have their keys
+	applied     uint64 // entries of a control log already applied
+	since       time.Time
+	keyReported bool   // a failure to derive or read its entries was reported
+	gapReported bool   // a closed segment that lacks entries was reported
+	opened      bool   // a control log that has opened a segment
+	openedTo    uint64 // the newest epoch it opened one for
 }
 
 func (l *roomLog) key() logKey { return keyOf(l.owner, l.id) }

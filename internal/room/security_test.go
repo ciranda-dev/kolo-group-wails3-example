@@ -471,3 +471,51 @@ func TestRepeatedLeaveRequestsStartOneRemoval(t *testing.T) {
 	gr.waitEpoch(admin.Status().Epoch)
 	waitFor(t, 30*time.Second, "the removal", func() bool { return len(admin.Members()) == 1 })
 }
+
+// A segment whose entry keys failed once still reports that it lacks entries.
+func TestGapIsReportedAfterAKeyFailure(t *testing.T) {
+	gr := newGroup(t, 2, Limits{CatchUpWait: 100 * time.Millisecond})
+	gr.waitMesh(1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if _, err := gr.rooms[0].Send(ctx, []byte("x"), MessageID{}); err != nil {
+		t.Fatal(err)
+	}
+	m := gr.rooms[1]
+	var seg *roomLog
+	waitFor(t, 20*time.Second, "a replica of a segment", func() bool {
+		for _, l := range m.snapshot() {
+			if !l.own && !l.ctl && !l.tree {
+				seg = l
+			}
+		}
+		return seg != nil
+	})
+	m.reportOnce(seg, errors.New("a key that failed"))
+	m.logMu.Lock()
+	seg.closed, seg.size = true, 1000
+	m.logMu.Unlock()
+	waitFor(t, 10*time.Second, "the report of the gap", func() bool {
+		for _, ev := range errEvents(gr.recs[1]) {
+			if strings.Contains(ev.Err.Error(), "of 1000 entries") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// Each secret of a room comes from its own label: the room secret is not the MLS export under the topic's label.
+func TestRoomSecretAndTopicUseTheirOwnLabels(t *testing.T) {
+	gr := newGroup(t, 1, Limits{})
+	r := gr.rooms[0]
+	r.mu.Lock()
+	b, err := r.m.Export("kolo-group/topic/v0", r.m.GroupID(), keySize)
+	r.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if [keySize]byte(b) == r.secret {
+		t.Fatal("the room secret is the export under the topic's label")
+	}
+}

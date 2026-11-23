@@ -374,7 +374,7 @@ func (n *Node) Create(ctx context.Context, name string, p Policy) (*Room, error)
 	if err != nil {
 		return fail(err)
 	}
-	secret, err := m.Export(topicLabel, m.GroupID(), keySize)
+	secret, err := m.Export(secretLabel, m.GroupID(), keySize)
 	if err != nil {
 		m.Close()
 		return fail(err)

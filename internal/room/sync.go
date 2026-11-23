@@ -167,8 +167,8 @@ func (r *Room) scanControl() (grew bool) {
 
 func (r *Room) reportOnce(l *roomLog, err error) {
 	r.logMu.Lock()
-	again := l.reported
-	l.reported = true
+	again := l.keyReported
+	l.keyReported = true
 	r.logMu.Unlock()
 	if !again {
 		r.emit(Event{Kind: CatchingUp, Err: fmt.Errorf("%w: %w", ErrCatchUp, err)})
@@ -540,8 +540,8 @@ func (r *Room) reportGaps() {
 		if l.since.IsZero() {
 			l.since = now
 		}
-		if !l.reported && now.Sub(l.since) >= r.n.limits.CatchUpWait {
-			l.reported = true
+		if !l.gapReported && now.Sub(l.since) >= r.n.limits.CatchUpWait {
+			l.gapReported = true
 			gaps = append(gaps, fmt.Sprintf("a segment of device %x holds %d of %d entries", l.owner[:4], l.view.Len(), l.size))
 		}
 	}

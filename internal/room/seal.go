@@ -17,14 +17,15 @@ import (
 )
 
 const (
-	keyLabel   = "kolo-group/history/v0"
-	topicLabel = "kolo-group/topic/v0"
-	aadLabel   = "kolo-group/message/v0"
-	authorCtx  = "kolo-group/author/v0"
-	idLabel    = "kolo-group/id/v0"
-	logLabel   = "kolo-group/log/v0"
-	keySize    = chacha20poly1305.KeySize
-	nonceSize  = chacha20poly1305.NonceSizeX
+	keyLabel    = "kolo-group/epoch-key/v0"
+	secretLabel = "kolo-group/room-secret/v0"
+	topicLabel  = "kolo-group/topic/v0"
+	aadLabel    = "kolo-group/message/v0"
+	authorCtx   = "kolo-group/author/v0"
+	idLabel     = "kolo-group/id/v0"
+	logLabel    = "kolo-group/log/v0"
+	keySize     = chacha20poly1305.KeySize
+	nonceSize   = chacha20poly1305.NonceSizeX
 )
 
 // epochKey is K_e: the key every member of an epoch derives from the MLS exporter.
