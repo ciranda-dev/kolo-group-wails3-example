@@ -168,3 +168,28 @@ func TestSecondSettledCommitOfAnEpochIsReported(t *testing.T) {
 		t.Fatalf("reports: %v", errEvents(gr.recs[1]))
 	}
 }
+
+// An entry of a segment sealed under an epoch after the segment's is reported, and the entries after it are read.
+func TestFarEpochEntryIsReportedAndTheSegmentGoesOn(t *testing.T) {
+	gr := newGroup(t, 2, Limits{CatchUpWait: 2 * time.Second, PinWait: 500 * time.Millisecond})
+	gr.waitMesh(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	admin := gr.rooms[0]
+	if _, err := admin.Send(ctx, []byte("first"), MessageID{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 20*time.Second, "first", func() bool { return gr.recs[1].has("first") })
+	gr.stop(1)
+	bad := &sealed{Epoch: 1 << 40, CT: []byte{1, 2, 3}}
+	if err := admin.archive(&stored{Device: [32]byte(gr.nodes[0].key()), Seq: 1, Body: bad.encode()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Send(ctx, []byte("after"), MessageID{}); err != nil {
+		t.Fatal(err)
+	}
+	r := gr.restart(1)
+	waitFor(t, 30*time.Second, "the message after the far entry", func() bool { return gr.recs[1].has("after") })
+	waitFor(t, 10*time.Second, "the report", func() bool { return hasErr(gr.recs[1], ErrWrongEpoch) })
+	waitFor(t, 10*time.Second, "the end of the catch-up", func() bool { return !r.Status().CatchingUp })
+}

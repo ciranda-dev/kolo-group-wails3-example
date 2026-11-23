@@ -500,7 +500,8 @@ func (r *Room) readEntry(l *roomLog, i uint64, b []byte, err error) (wait bool) 
 	key, ok := r.keys[epoch]
 	r.kmu.RUnlock()
 	if !ok {
-		if epoch > r.view.Load().epoch {
+		// A segment holds messages of its own epoch and of the ones before it: only those wait for the room to catch up.
+		if epoch <= l.epoch && epoch > r.view.Load().epoch {
 			return true
 		}
 		return fail(id, st.Device[:], epoch, ErrWrongEpoch)
