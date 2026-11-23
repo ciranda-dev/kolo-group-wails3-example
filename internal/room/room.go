@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -91,6 +92,7 @@ type Config struct {
 type Policy struct {
 	History       HistoryRule
 	Since         uint64              // with SinceEpoch
+	SinceCommit   bool                // with SinceEpoch and no Since: SetPolicy starts the rule at the epoch of its Commit
 	Posters       []ed25519.PublicKey // persons that may post
 	PosterDevices []ed25519.PublicKey // devices that may post
 	AdminsPost    bool                // the admin devices may post
@@ -111,6 +113,7 @@ type Status struct {
 	Receipts     int   // messages sent that no segment holds yet
 	CatchingUp   bool  // a followed log has entries not read, or a peer offers more than the device holds
 	AdminsOnline int   // other admin devices connected now
+	Peers        int   // other devices of the room's current epoch connected now
 	PinError     error // the last error of a push to the pins, nil when the last push worked
 }
 
@@ -629,6 +632,9 @@ func (r *Room) ID() GroupID { return r.gid }
 // Name returns the name the room was created with.
 func (r *Room) Name() string { return r.name }
 
+// Reader reports whether the room was joined with a read link: this device reads it and is no member.
+func (r *Room) Reader() bool { return r.reader }
+
 // Close leaves the room's topic and stops its work; the room's state stays in the stores.
 func (r *Room) Close() error {
 	r.once.Do(func() {
@@ -813,12 +819,20 @@ func (r *Room) emit(evs ...Event) {
 
 // Members lists the devices of the room's current epoch, in the order of the tree.
 func (r *Room) Members() []Member {
-	v := r.view.Load()
-	out := make([]Member, len(v.members))
-	for i, m := range v.members {
+	out, _ := r.MembersPage(0, math.MaxInt)
+	return out
+}
+
+// MembersPage returns up to n devices of Members from offset on, and the number of devices in the current epoch.
+func (r *Room) MembersPage(offset, n int) ([]Member, int) {
+	all := r.view.Load().members
+	offset = min(max(offset, 0), len(all))
+	page := all[offset : offset+min(max(n, 0), len(all)-offset)]
+	out := make([]Member, len(page))
+	for i, m := range page {
 		out[i] = Member{Person: slices.Clone(m.Person), Device: slices.Clone(m.Device), Role: m.Role}
 	}
-	return out
+	return out, len(all)
 }
 
 // Status reports the room's state.
@@ -832,7 +846,7 @@ func (r *Room) Status() Status {
 	r.dmu.Lock()
 	perr := r.pinErr
 	r.dmu.Unlock()
-	return Status{Epoch: r.view.Load().epoch, Logs: logs, Receipts: rc, CatchingUp: r.catchingUp(), AdminsOnline: r.adminsOnline(), PinError: perr}
+	return Status{Epoch: r.view.Load().epoch, Logs: logs, Receipts: rc, CatchingUp: r.catchingUp(), AdminsOnline: r.adminsOnline(), Peers: r.peersOnline(), PinError: perr}
 }
 
 func (r *Room) run() {

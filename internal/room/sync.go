@@ -674,6 +674,19 @@ func (r *Room) catchingUp() bool {
 }
 
 // adminsOnline counts the admin devices, other than this one, that are connected.
+func (r *Room) peersOnline() int {
+	v := r.view.Load()
+	n := 0
+	r.n.mu.Lock()
+	for k := range r.n.conns {
+		if k != [32]byte(r.self) && v.author(k) != nil {
+			n++
+		}
+	}
+	r.n.mu.Unlock()
+	return n
+}
+
 func (r *Room) adminsOnline() int {
 	roles := r.view.Load().roles
 	n := 0
