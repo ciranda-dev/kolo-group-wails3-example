@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -36,7 +37,8 @@ func (r *Room) isAdmin() bool {
 }
 
 // Promote makes the device an admin: it joins the admins' braid, and the roles name it in the next settled Commit, so it
-// writes segments and commits as this device does. Only an admin promotes, only to Admin, and the device must be online.
+// writes segments and commits as this device does. Only an admin promotes, only to Admin. The offer is sent again every
+// RepublishAfter until the device answers, so a device that is offline or not in the mesh yet gets it when it is.
 func (r *Room) Promote(ctx context.Context, device ed25519.PublicKey, role Role) error {
 	if role != Admin {
 		return fmt.Errorf("%w: only the role Admin is built", ErrNotImplemented)
@@ -71,14 +73,17 @@ func (r *Room) Promote(ctx context.Context, device ed25519.PublicKey, role Role)
 		delete(r.promoting, dev)
 		r.promoMu.Unlock()
 	}()
-	if _, err := r.publish(ctx, func(uint64) ([]byte, error) { return (&adminOffer{Kind: kindPromote, Device: dev}).encode(), nil }); err != nil {
-		return err
-	}
 	var req *adminRequest
-	select {
-	case req = <-reqs:
-	case <-ctx.Done():
-		return ctx.Err()
+	for req == nil {
+		if _, err := r.publish(ctx, func(uint64) ([]byte, error) { return (&adminOffer{Kind: kindPromote, Device: dev}).encode(), nil }); err != nil {
+			return err
+		}
+		select {
+		case req = <-reqs:
+		case <-time.After(r.n.limits.RepublishAfter):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	welcome, err := b.Admit(ctx, device, req.Request, &kolobraid.AdmitOptions{Roles: ptr(kolobraid.RoleAdmin)})
 	if err != nil {
@@ -100,14 +105,23 @@ func (r *Room) Promote(ctx context.Context, device ed25519.PublicKey, role Role)
 			return ctx.Err()
 		}
 	}
-	next := *v.roles
-	next.Admins = append(slices.Clone(v.roles.Admins), dev)
-	slices.SortFunc(next.Admins, func(a, b [32]byte) int { return bytes.Compare(a[:], b[:]) })
-	exts, err := groupExtensions(&next, v.pol)
-	if err != nil {
-		return err
+	_, _, _, err = r.commit(ctx, func(v *view) (kolomls.CommitOptions, error) {
+		switch {
+		case v.author(dev) == nil:
+			return kolomls.CommitOptions{}, fmt.Errorf("%w: no such device", ErrNotMember)
+		case v.roles.Admin(device):
+			return kolomls.CommitOptions{}, errNoChange
+		}
+		next := *v.roles
+		next.Admins = append(slices.Clone(v.roles.Admins), dev)
+		slices.SortFunc(next.Admins, func(a, b [32]byte) int { return bytes.Compare(a[:], b[:]) })
+		exts, err := groupExtensions(&next, v.pol)
+		return kolomls.CommitOptions{SetExtensions: true, Extensions: exts}, err
+	})
+	if errors.Is(err, errNoChange) {
+		return nil
 	}
-	if _, _, _, err := r.commit(ctx, kolomls.CommitOptions{SetExtensions: true, Extensions: exts}); err != nil {
+	if err != nil {
 		return err
 	}
 	if err := r.appendCtl(&ctlRecord{Kind: ctlDir, Header: req.Header}); err != nil {

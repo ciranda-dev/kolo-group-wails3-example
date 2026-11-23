@@ -1,7 +1,9 @@
 package room
 
 import (
+	"cmp"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"slices"
@@ -17,7 +19,10 @@ import (
 func ctlRecords(t *testing.T, r *Room, own bool) []*ctlRecord {
 	t.Helper()
 	var out []*ctlRecord
-	for _, l := range r.snapshot() {
+	logs := r.snapshot()
+	// A device has a control log per epoch, which the snapshot lists in no order.
+	slices.SortStableFunc(logs, func(a, b *roomLog) int { return cmp.Compare(a.epoch, b.epoch) })
+	for _, l := range logs {
 		if !l.ctl || l.own != own {
 			continue
 		}
@@ -38,7 +43,7 @@ func ctlRecords(t *testing.T, r *Room, own bool) []*ctlRecord {
 
 func segments(r *Room) (out []*roomLog) {
 	for _, l := range r.snapshot() {
-		if !l.ctl {
+		if !l.ctl && !l.tree {
 			out = append(out, l)
 		}
 	}
@@ -133,12 +138,13 @@ func TestKeepSegmentsForgetsTheOldestReadOnes(t *testing.T) {
 	waitFor(t, 30*time.Second, "the member to read and trim", func() bool {
 		return gr.recs[1].has("m11") && len(segments(member)) <= 3
 	})
-	// The control log, at most KeepSegments closed segments and the one being written.
-	if n := member.Status().Logs; n > 4 {
+	// The control log, at most KeepSegments closed segments, the one being written and the tree log of the epoch.
+	if n := member.Status().Logs; n > 5 {
 		t.Fatalf("%d logs held", n)
 	}
-	// An admin forgets its own closed segments the same way, and keeps them in its store.
-	waitFor(t, 30*time.Second, "the admin to trim", func() bool { return gr.rooms[0].Status().Logs <= 4 })
+	// An admin forgets its own closed segments the same way, and keeps them in its store; it also keeps the tree log of the
+	// member it added and its control logs of the room's two epochs.
+	waitFor(t, 30*time.Second, "the admin to trim", func() bool { return gr.rooms[0].Status().Logs <= 6 })
 	if !bodiesIn2(gr.recs[1], "m", 12) {
 		t.Fatal("a message was lost to the trim")
 	}
@@ -306,7 +312,7 @@ func TestPinsAdapterOverTheControlLog(t *testing.T) {
 		t.Fatalf("the archive of an epoch lists %v: messages are not MLS messages", page)
 	}
 	// A member that is no admin cannot write a Commit.
-	if err := (roomPins{gr.rooms[1]}).Put(ctx, settle.ObjectKey([32]byte{2}), []byte("x")); !errors.Is(err, ErrNotAdmin) {
+	if err := (roomPins{gr.rooms[1]}).Put(ctx, settle.ObjectKey(sha256.Sum256([]byte("x"))), []byte("x")); !errors.Is(err, ErrNotAdmin) {
 		t.Fatalf("Put by a member that is no admin: %v", err)
 	}
 }

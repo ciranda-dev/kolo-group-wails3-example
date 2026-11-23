@@ -18,7 +18,7 @@ This repository is private and experimental. It builds only inside the Kolo work
 - **Manage the room**: members and admins (make a device an admin, remove a person, choose who may post), the room's status (epoch, catching up, pins, devices connected), settings with the pins, entry nodes and relays the app was started with, and leaving.
 - **Scroll back**: the messages this device was told of, and, for a member who joined late, the history before the join as far as the room's rule allows.
 - **Run with no window**: `-headless` is an always-on device over the same data folder. Made an admin, it writes the segments of its rooms and pushes them to the pins, so a room can be read by people who were away while every person's computer is off.
-- **Run the room code** in `internal/room`: the live room, segments, catch-up, history, posters, the read link and leaving. [How it works](docs/how-it-works.md) says what is built and what is planned.
+- **Run the room code** in `internal/room`: the live room, segments, catch-up, history, posters, the read link, leaving, Commits carried by reference and the encrypted tree served to joiners. [How it works](docs/how-it-works.md) says what is built and what is planned.
 
 ## Platforms
 

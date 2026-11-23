@@ -17,6 +17,7 @@ type view struct {
 	key     [keySize]byte
 	authors map[[32]byte]*kologossip.Author
 	members []Member
+	leaves  []uint32 // the leaf of each member, for a view read from the tree
 	roles   *settle.Roles
 	pol     *roomPolicy
 	// prev is the epoch before, kept until prevUntil so messages in flight still pass.
@@ -52,6 +53,7 @@ func newView(m *settle.Member, old *view, now time.Time, window time.Duration) (
 		}
 		v.authors[dev] = a
 		v.members = append(v.members, Member{Person: bytes.Clone(c.Person()), Device: bytes.Clone(c.Device()), Role: roleOf(roles, dev[:])})
+		v.leaves = append(v.leaves, l)
 	}
 	v.keepPrev(old, now, window)
 	return v, nil

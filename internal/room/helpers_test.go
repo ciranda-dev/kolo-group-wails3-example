@@ -23,6 +23,7 @@ import (
 	kolostore "github.com/ciranda-dev/kolo-store"
 	koloswarm "github.com/ciranda-dev/kolo-swarm"
 	kolotransport "github.com/ciranda-dev/kolo-transport"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/ciranda-dev/kolo-mls/backendstore"
 )
@@ -94,6 +95,7 @@ type tnode struct {
 	opts    tnodeOpts
 	mls     kolostore.Backend // what a restart keeps: the MLS state, the room's state and the logs
 	backend kolostore.Backend
+	logs    kolostore.Backend // the backend of store, in memory
 	store   *kolostore.Store
 
 	askedMu sync.Mutex
@@ -131,11 +133,15 @@ type tnodeOpts struct {
 	allow   func(ed25519.PublicKey, netip.AddrPort) bool // replaces the node's own Allow
 	noServe bool                                         // the test serves no connection: a device that is no member
 	policy  Policy                                       // the policy a created room gets
+	serve   bool                                         // Config.ServeTree
+	// beforeOpen, when set, replaces the bootstrap of a start: it gets the swarm before the room node opens.
+	beforeOpen func(*koloswarm.Swarm)
 }
 
 func newTNode(t testing.TB, o tnodeOpts) *tnode {
 	t.Helper()
-	tn := &tnode{t: t, opts: o, person: o.person, dev: ident(t), mls: kolostore.NewMemory(), backend: kolostore.NewMemory(), store: kolostore.New(kolostore.NewMemory())}
+	tn := &tnode{t: t, opts: o, person: o.person, dev: ident(t), mls: kolostore.NewMemory(), backend: kolostore.NewMemory(), logs: kolostore.NewMemory()}
+	tn.store = kolostore.New(tn.logs)
 	if tn.person == nil {
 		tn.person = ident(t)
 	}
@@ -194,11 +200,21 @@ func (tn *tnode) start() {
 		t.Fatal(err)
 	}
 	tn.sw = sw
-	if o.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := sw.Bootstrap(ctx, []netip.AddrPort{addrOf(o.server.Addr())}); err != nil {
-			t.Fatal(err)
+	if o.beforeOpen != nil {
+		o.beforeOpen(sw)
+	} else if o.server != nil {
+		// One server on 127.0.0.1 serves every device of a test; under -race and a high load it can miss a few answers.
+		deadline := time.Now().Add(time.Minute)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err := sw.Bootstrap(ctx, []netip.AddrPort{addrOf(o.server.Addr())})
+			cancel()
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal(err)
+			}
 		}
 	}
 	if tn.g, err = kologossip.New(tn.dev, &kologossip.Config{Cert: tn.cert, Swarm: sw, HeartbeatInterval: 100 * time.Millisecond}); err != nil {
@@ -206,7 +222,7 @@ func (tn *tnode) start() {
 	}
 	tn.np.Store(nil)
 	tn.n, err = Open(context.Background(), &Config{Device: tn.dev, Cert: tn.cert, Swarm: sw, Gossip: tn.g, MLSStore: backendstore.New(tn.mls, []byte("mls/")),
-		Backend: tn.backend, Store: tn.store, Pins: o.pins, BraidLimits: braidLimits(), Limits: o.limits})
+		Backend: tn.backend, Store: tn.store, Pins: o.pins, BraidLimits: braidLimits(), Limits: o.limits, ServeTree: o.serve})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,6 +378,7 @@ type group struct {
 	keep   map[int]bool // members whose recorders keep every event even then
 	lim    Limits
 	pins   []pin.Peer
+	serve  bool // the members that join serve trees; the first device is the admin
 }
 
 // newGroup creates a room on a new node and adds n-1 more nodes to it, one Add per node, and waits until every
@@ -380,8 +397,14 @@ func newGroupWith(t testing.TB, n int, lim Limits, mod func(*tnodeOpts)) *group 
 // newGroupPins is newGroupWith for devices that use the given pins.
 func newGroupPins(t testing.TB, n int, lim Limits, pins []pin.Peer, mod func(*tnodeOpts)) *group {
 	t.Helper()
+	return newGroupServe(t, n, lim, pins, false, mod)
+}
+
+// newGroupServe is newGroupPins for members that serve trees when serve is set.
+func newGroupServe(t testing.TB, n int, lim Limits, pins []pin.Peer, serve bool, mod func(*tnodeOpts)) *group {
+	t.Helper()
 	server := newServer(t)
-	gr := &group{t: t, server: server, lim: lim, pins: pins}
+	gr := &group{t: t, server: server, lim: lim, pins: pins, serve: serve}
 	fo := tnodeOpts{server: server, limits: lim, pins: pins}
 	if mod != nil {
 		mod(&fo)
@@ -402,7 +425,7 @@ func newGroupPins(t testing.TB, n int, lim Limits, pins []pin.Peer, mod func(*tn
 
 // newNode makes a device that can join the group: it uses the group's server, limits and pins.
 func (gr *group) newNode() *tnode {
-	return newTNode(gr.t, tnodeOpts{server: gr.server, limits: gr.lim, pins: gr.pins})
+	return newTNode(gr.t, tnodeOpts{server: gr.server, limits: gr.lim, pins: gr.pins, serve: gr.serve})
 }
 
 // join adds nd to the room with an Add by the first node and waits for every member to reach the new epoch.
@@ -450,12 +473,19 @@ func (gr *group) joinBatch(ctx context.Context, nds []*tnode) {
 	if err != nil {
 		gr.t.Fatal(err)
 	}
-	for _, nd := range nds {
-		r, err := nd.n.Join(ctx, w)
-		if err != nil {
-			gr.t.Fatal(err)
+	// Each join pulls its tree from the devices a lookup finds, so they run together.
+	joined := make([]*Room, len(nds))
+	errs := make([]error, len(nds))
+	var wg sync.WaitGroup
+	for i, nd := range nds {
+		wg.Go(func() { joined[i], errs[i] = nd.n.Join(ctx, w) })
+	}
+	wg.Wait()
+	for i, nd := range nds {
+		if errs[i] != nil {
+			gr.t.Fatal(errs[i])
 		}
-		gr.nodes, gr.rooms, gr.recs = append(gr.nodes, nd), append(gr.rooms, r), append(gr.recs, recordWith(r, gr.light))
+		gr.nodes, gr.rooms, gr.recs = append(gr.nodes, nd), append(gr.rooms, joined[i]), append(gr.recs, recordWith(joined[i], gr.light))
 	}
 	gr.waitEpoch(gr.rooms[0].Status().Epoch)
 }
@@ -513,7 +543,31 @@ type pinServer struct {
 	peer pin.Peer
 	stop context.CancelFunc
 	done chan error
+	reg  *prometheus.Registry
 }
+
+// metric returns the sum of the counters named name whose op label is op ("" for any).
+func (ps *pinServer) metric(name, op string) (sum float64) {
+	mfs, _ := ps.reg.Gather()
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			ok := op == ""
+			for _, l := range m.GetLabel() {
+				ok = ok || l.GetName() == "op" && l.GetValue() == op
+			}
+			if ok {
+				sum += m.GetCounter().GetValue()
+			}
+		}
+	}
+	return sum
+}
+
+// served is the bytes the pin sent to peers pulling its logs.
+func (ps *pinServer) served() uint64 { return uint64(ps.metric("kolo_pin_bytes_served_total", "")) }
 
 func newPin(t testing.TB) *pinServer {
 	t.Helper()
@@ -531,8 +585,8 @@ func newPin(t testing.TB) *pinServer {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	ps := &pinServer{peer: pin.Peer{ID: id.PublicKey(), Addr: ln.Addr().String()}, stop: cancel, done: make(chan error, 1)}
-	go func() { ps.done <- pin.Serve(ctx, ln, pin.Options{Dir: dir}) }()
+	ps := &pinServer{peer: pin.Peer{ID: id.PublicKey(), Addr: ln.Addr().String()}, stop: cancel, done: make(chan error, 1), reg: prometheus.NewRegistry()}
+	go func() { ps.done <- pin.Serve(ctx, ln, pin.Options{Dir: dir, Metrics: ps.reg}) }()
 	t.Cleanup(func() { ps.down() })
 	return ps
 }

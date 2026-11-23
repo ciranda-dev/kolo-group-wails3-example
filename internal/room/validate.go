@@ -78,19 +78,20 @@ func (r *Room) check(m *kologossip.Message) error {
 		if err != nil {
 			return err
 		}
-		if !r.mayPostAt(v, s.Epoch, m.Person, m.Device) {
+		if !r.mayPostAt(v, s.Epoch, liveAt(v, s.Epoch, now), m.Person, m.Device) {
 			return ErrNotPoster
+		}
+		// The token is taken before the signature and the AEAD, so a flood costs its author before it costs this node.
+		if !r.rate.allow([32]byte(m.Device), now) {
+			return ErrRate
 		}
 		if err := verifySealed(m.Device, r.gid[:], s, m.Seq); err != nil {
 			return err
 		}
-		if !r.rate.allow([32]byte(m.Device), now) {
-			return ErrRate
-		}
 		_, err = r.openMessage(&key, s, m)
 		return err
 	case kindCommit:
-		c, err := decodeCommit(m.Body)
+		c, err := decodeCommitRef(m.Body)
 		if err != nil {
 			return err
 		}
@@ -106,6 +107,9 @@ func (r *Room) check(m *kologossip.Message) error {
 		}
 		if !r.rate.allow([32]byte(m.Device), now) {
 			return ErrRate
+		}
+		if st.Valid(v.roles, func(d [32]byte) bool { return v.author(d) != nil }) < v.roles.Q() {
+			return ErrCommitRef
 		}
 		return nil
 	case kindPromote, kindAdminWelcome:

@@ -8,12 +8,14 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	kolobraid "github.com/ciranda-dev/kolo-braid"
+	kolodht "github.com/ciranda-dev/kolo-dht"
 	kologossip "github.com/ciranda-dev/kolo-gossip"
 	koloid "github.com/ciranda-dev/kolo-id"
 	kololog "github.com/ciranda-dev/kolo-log"
@@ -78,8 +80,11 @@ type Config struct {
 	// BraidLimits are the local bounds of the admins' braid; nil takes kolo-braid's defaults.
 	BraidLimits *kolobraid.Limits
 	Pins        []pin.Peer
-	Now         func() time.Time
-	Limits      Limits
+	// ServeTree makes a member that is no admin keep and serve the tree logs of joiners, as the admins and the pins do; it
+	// pulls the tree of every Add (14.5 MB at 30,000 leaves) and sends it to each joiner that asks. Off by default.
+	ServeTree bool
+	Now       func() time.Time
+	Limits    Limits
 }
 
 // Policy is the room setting that a Commit changes: who may read the history, who may post and whether the room has a read
@@ -87,6 +92,7 @@ type Config struct {
 type Policy struct {
 	History       HistoryRule
 	Since         uint64              // with SinceEpoch
+	SinceCommit   bool                // with SinceEpoch and no Since: SetPolicy starts the rule at the epoch of its Commit
 	Posters       []ed25519.PublicKey // persons that may post
 	PosterDevices []ed25519.PublicKey // devices that may post
 	AdminsPost    bool                // the admin devices may post
@@ -107,6 +113,7 @@ type Status struct {
 	Receipts     int   // messages sent that no segment holds yet
 	CatchingUp   bool  // a followed log has entries not read, or a peer offers more than the device holds
 	AdminsOnline int   // other admin devices connected now
+	Peers        int   // other devices of the room's current epoch connected now
 	PinError     error // the last error of a push to the pins, nil when the last push worked
 }
 
@@ -123,9 +130,6 @@ type Event struct {
 	Epoch   uint64
 	Err     error
 }
-
-// envelopeReserve bounds what gossip's envelope adds to a body; TestEnvelopeOverhead measures 178 bytes.
-const envelopeReserve = 256
 
 // Room is one group.
 type Room struct {
@@ -148,13 +152,15 @@ type Room struct {
 
 	kmu  sync.RWMutex
 	keys map[uint64][keySize]byte
-	lo   uint64   // the oldest epoch in keys, guarded by kmu
-	pols []polRec // the policy of each epoch it changed in, guarded by kmu
+	alts map[uint64][][keySize]byte // other keys that history links gave for an epoch, guarded by kmu
+	lo   uint64                     // the oldest epoch in keys, guarded by kmu
+	pols []polRec                   // the policy of each epoch it changed in, guarded by kmu
 
 	reader  bool          // a room joined with a read link: no MLS member, only the epoch keys of the link's records
 	readKey [keySize]byte // seals the state records, with reader
 
 	ever      map[[32]byte]*kologossip.Author // every author the room has had, guarded by kmu
+	first     map[[32]byte]uint64             // the first epoch this device saw each author a leaf in, guarded by kmu
 	joinEpoch uint64
 
 	rate   *limiter
@@ -178,8 +184,9 @@ type Room struct {
 	bp         atomic.Pointer[kolobraid.Braid] // b, for readers that must not take mu
 	pins       settle.Pins
 	adminKick  chan struct{}
-	stepErr    error                 // guarded by mu
-	badCommits map[[32]byte]struct{} // the Commits of this epoch reported as unusable, guarded by mu
+	stepErr    error                  // guarded by mu
+	badCommits map[[32]byte]struct{}  // the Commits and SettledCommits of this epoch reported as unusable, guarded by mu
+	settledIn  map[uint64]*seenCommit // the Commit a quorum settled for each recent epoch, guarded by mu
 
 	kv       roomKV
 	logSec   *kololog.EntrySecret
@@ -193,16 +200,23 @@ type Room struct {
 	ctl   *roomLog
 	meta  meta
 
-	hmu    sync.Mutex           // guards links, past and pastBy
-	links  map[uint64][]linkRec // the history links of each epoch before the join, one for each admin
-	past   map[uint64][]*pastSeg
-	pastBy map[logKey]*pastSeg
+	hmu      sync.Mutex           // guards links, past, pastBy and prevs
+	links    map[uint64][]linkRec // the history links of each epoch before the join, one for each admin
+	past     map[uint64][]*pastSeg
+	pastBy   map[logKey]*pastSeg
+	prevs    []prevLog         // the control logs that came before the ones followed
+	early    map[logKey]uint64 // the final sizes of segments closed before a log that opened them was read
+	needPast atomic.Uint64     // one past the epoch History is loading, 0 before it loads one
 
-	histMu sync.Mutex // serializes History and guards what follows
-	hbound uint64     // the epochs from it up are loaded
-	hbuf   []Event    // loaded and not returned yet, oldest first
-	hlast  MessageID  // the oldest message of the last page
-	hseen  *idSet
+	histMu   sync.Mutex // serializes History and guards what follows
+	hbound   uint64     // the epochs from it up are loaded
+	hbuf     []Event    // loaded and not returned yet, oldest first
+	hlast    MessageID  // the oldest message of the last page
+	hseen    *idSet
+	hreports []Event // reports of the links for the next page
+
+	wmu      sync.Mutex
+	welcomed map[[32]byte]uint64 // the devices this admin added that have not made contact, with the epoch of their Welcome
 
 	ctlMu sync.Mutex // orders the appends to the control log
 	segMu sync.Mutex // guards seg and orders the appends to it
@@ -211,9 +225,13 @@ type Room struct {
 	promoMu   sync.Mutex
 	promoting map[[32]byte]chan *adminRequest // devices this admin offered the role to
 
+	leaveMu sync.Mutex
+	leaving map[[32]byte]struct{} // persons whose removal this admin is making
+
 	rmu  sync.Mutex
 	rcpt map[MessageID]*receipt
 
+	hint     atomic.Pointer[hint]
 	progress atomic.Int64 // when a log last grew or was read, in Unix nanoseconds
 	pinMu    sync.Mutex
 	pinSince time.Time
@@ -249,12 +267,12 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 		kv = newRoomKV(kolostore.NewMemory(), gid)
 	}
 	r := &Room{n: n, gid: gid, name: name, secret: secret, self: n.cfg.Device.PublicKey(), m: m,
-		gone: make(chan struct{}), keys: map[uint64][keySize]byte{v.epoch: v.key}, rate: newLimiter(n.limits.Rate, n.limits.Burst),
+		gone: make(chan struct{}), keys: map[uint64][keySize]byte{v.epoch: v.key}, alts: map[uint64][][keySize]byte{}, rate: newLimiter(n.limits.Rate, n.limits.Burst),
 		out: newLimiter(n.limits.Rate*4/5, max(1, n.limits.Burst-1)), ord: newOrderer(n.cfg.Device.PublicKey(), n.limits), seen: newIDSet(n.limits.MaxKnown), events: make(chan Event, n.limits.EventQueue),
 		adminKick: make(chan struct{}, 1), syncKick: make(chan struct{}, 1), pushKick: make(chan struct{}, 1),
-		kv: kv, logSec: sec, logs: map[logKey]*roomLog{}, dirs: map[[32]byte][]byte{}, rcpt: map[MessageID]*receipt{},
-		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, badCommits: map[[32]byte]struct{}{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, joinEpoch: v.epoch,
-		links: map[uint64][]linkRec{}, past: map[uint64][]*pastSeg{}, pastBy: map[logKey]*pastSeg{}}
+		kv: kv, logSec: sec, logs: map[logKey]*roomLog{}, dirs: map[[32]byte][]byte{}, rcpt: map[MessageID]*receipt{}, welcomed: map[[32]byte]uint64{},
+		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, leaving: map[[32]byte]struct{}{}, badCommits: map[[32]byte]struct{}{}, settledIn: map[uint64]*seenCommit{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, first: map[[32]byte]uint64{}, joinEpoch: v.epoch,
+		links: map[uint64][]linkRec{}, past: map[uint64][]*pastSeg{}, pastBy: map[logKey]*pastSeg{}, early: map[logKey]uint64{}}
 	if readKey != nil {
 		r.reader, r.readKey = true, *readKey
 	}
@@ -299,8 +317,8 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 	n.rooms[r.gid] = r
 	n.mu.Unlock()
 	n.refreshMembers()
-	r.gr, err = n.cfg.Gossip.Join(ctx, topicOf(secret), &kologossip.TopicOptions{
-		Authors: authors{r}, Validate: r.validate, MaxMessageSize: n.limits.MaxMessageSize, Seq: r.cur.Load,
+	r.gr, err = n.joinTopic(ctx, topicOf(secret), &kologossip.TopicOptions{
+		Authors: authors{r}, Validate: r.validate, MaxMessageSize: n.limits.MaxMessageSize, Seq: r.cur.Load, AllowPeer: r.allowPeer,
 	})
 	if err != nil {
 		n.mu.Lock()
@@ -315,6 +333,56 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 	return r, nil
 }
 
+// joinTopic joins a room's gossip topic. The swarm join announces the topic, which fails while no server of the discovery
+// network answers: it is tried again, each time after twice the wait before up to PinWait, until ctx ends, so a restart in
+// a moment the network does not answer opens the rooms once it does.
+func (n *Node) joinTopic(ctx context.Context, t kologossip.Topic, o *kologossip.TopicOptions) (*kologossip.Room, error) {
+	wait := 50 * time.Millisecond
+	for {
+		gr, err := gossipJoin(n.cfg.Gossip, ctx, t, o)
+		if !errors.Is(err, kolodht.ErrNoNodes) {
+			return gr, err
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return nil, err
+		}
+		wait = min(2*wait, n.limits.PinWait)
+	}
+}
+
+// gossipJoin is Gossip.Join, which a test slows down.
+var gossipJoin = (*kologossip.Gossip).Join
+
+// allowPeer admits to the room's topic the devices of its current epoch, and of the previous one while its window lasts;
+// a room with a read link, or read with one, admits any device. A node that admits any device to its connections, for a
+// room with a read link or for a join, so never tells it about its closed rooms.
+func (r *Room) allowPeer(peer ed25519.PublicKey) bool {
+	if len(peer) != ed25519.PublicKeySize {
+		return false
+	}
+	v := r.view.Load()
+	if r.reader || v.pol.link {
+		return true
+	}
+	d := [32]byte(peer)
+	return v.author(d) != nil || v.prev != nil && r.n.now().Before(v.prevUntil) && v.prev.author(d) != nil
+}
+
+// refreshPeers asks the topic again about every connected peer, now and once the window of the previous epoch has ended.
+func (r *Room) refreshPeers() {
+	if r.gr == nil || r.ctx.Err() != nil {
+		return
+	}
+	r.gr.RefreshPeers()
+	time.AfterFunc(r.n.limits.PastEpoch, func() {
+		if r.ctx.Err() == nil {
+			r.gr.RefreshPeers()
+		}
+	})
+}
+
 // restore loads what a reopened room kept: its epoch keys, authors, receipts and logs, and stores what a new one starts with.
 func (r *Room) restore(v *view) error {
 	if err := r.kv.each(recKey, func(tail, val []byte) error {
@@ -322,6 +390,17 @@ func (r *Room) restore(v *view) error {
 			return fmt.Errorf("%w: epoch key record", ErrMalformed)
 		}
 		r.keys[unbe(tail)] = [keySize]byte(val)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := r.kv.each(recAlt, func(tail, val []byte) error {
+		if len(tail) != 8 || len(val) == 0 || len(val)%keySize != 0 {
+			return fmt.Errorf("%w: key record", ErrMalformed)
+		}
+		for k := range slices.Chunk(val, keySize) {
+			r.alts[unbe(tail)] = append(r.alts[unbe(tail)], [keySize]byte(k))
+		}
 		return nil
 	}); err != nil {
 		return err
@@ -357,20 +436,45 @@ func (r *Room) restore(v *view) error {
 	}); err != nil {
 		return err
 	}
+	if err := r.kv.each(recFirst, func(tail, val []byte) error {
+		if len(tail) != 32 || len(val) != 8 {
+			return fmt.Errorf("%w: first epoch record", ErrMalformed)
+		}
+		r.first[[32]byte(tail)] = unbe(val)
+		return nil
+	}); err != nil {
+		return err
+	}
 	if err := r.rememberAuthors(v); err != nil {
 		return err
 	}
 	if err := r.loadReceipts(); err != nil {
 		return err
 	}
+	if err := r.kv.each(recWelcome, func(tail, v []byte) error {
+		if len(tail) != 32 || len(v) != 8 {
+			return fmt.Errorf("%w: welcome record", ErrMalformed)
+		}
+		r.welcomed[[32]byte(tail)] = unbe(v)
+		return nil
+	}); err != nil {
+		return err
+	}
 	return r.reopenLogs()
 }
 
-// rememberAuthors keeps the authors of a view, so the messages of a device that left are still read.
+// rememberAuthors keeps the authors of a view, so the messages of a device that left are still read, and the first epoch
+// each was a leaf in.
 func (r *Room) rememberAuthors(v *view) error {
 	r.kmu.Lock()
 	defer r.kmu.Unlock()
 	for d, a := range v.authors {
+		if _, ok := r.first[d]; !ok {
+			r.first[d] = v.epoch
+			if err := r.kv.put(be(v.epoch), recFirst, d[:]); err != nil {
+				return err
+			}
+		}
 		if r.ever[d] == nil || !bytes.Equal(r.ever[d].Cert.Encode(), a.Cert.Encode()) {
 			r.ever[d] = a
 			if err := r.kv.putAuthor(d, a); err != nil {
@@ -402,29 +506,30 @@ func (r *Room) reopenLogs() error {
 	for _, x := range recs {
 		var l *roomLog
 		var err error
-		if !x.r.Ctl && !x.r.Own && x.r.Epoch < r.joinEpoch {
+		if !x.r.Ctl && !x.r.Own && (x.r.Epoch < r.joinEpoch || x.r.Tree && (x.r.Epoch < r.view.Load().epoch || !r.servesTree())) {
 			r.n.cfg.Store.Delete(x.id)
 			r.kv.del(recLog, x.owner[:], x.id[:])
 			continue
 		}
 		if x.r.Own {
 			if l, err = r.openLog(x.r.Ctl, x.r.Epoch, &x.id); err == nil {
+				l.tree = x.r.Tree
 				r.logMu.Lock()
 				err = r.trackLocked(l)
 				r.logMu.Unlock()
 			}
 		} else {
-			l, err = r.replicate(x.owner, x.r.Header, x.r.Ctl, x.r.Epoch)
+			l, err = r.replicateKind(x.owner, x.r.Header, x.r.Ctl, x.r.Tree, x.r.Epoch)
 		}
 		if err != nil {
 			return fmt.Errorf("room: reopening a log: %w", err)
 		}
 		r.logMu.Lock()
-		l.closed, l.size, l.cursor = x.r.Closed, x.r.Size, x.r.Cursor
-		if l.own && l.ctl {
+		l.closed, l.size, l.cursor, l.done = x.r.Closed, x.r.Size, x.r.Cursor, x.r.Done
+		if l.own && l.ctl && (!r.meta.HasCtl || l.id == r.meta.Ctl) {
 			r.ctl = l
 		}
-		if l.own && !l.ctl && !l.closed {
+		if l.own && !l.ctl && !l.tree && !l.closed {
 			r.seg = l
 		}
 		r.logMu.Unlock()
@@ -442,23 +547,31 @@ func (r *Room) reopenLogs() error {
 	return r.indexOwn()
 }
 
-// indexOwn rebuilds the index of this admin's own control log, and the ids of the segment it goes on writing.
+// indexOwn rebuilds the index of this admin's own control log and the ids of the segment it goes on writing, and writes
+// the history link and the readers' state of the current epoch when the log lacks them: a crash between applying a Commit
+// and writing them loses them, and with one admin the chain of links would end there.
 func (r *Room) indexOwn() error {
-	l := r.ctl
-	for i := uint64(0); i < l.log.Len(); i++ {
-		b, err := l.log.Get(i)
-		if err != nil {
-			return err
+	v := r.view.Load()
+	hasLink, hasRead := false, false
+	for _, l := range r.logs {
+		if !l.own || !l.ctl {
+			continue
 		}
-		rec, err := decodeCtl(b, r.n.limits.MaxMessageSize)
-		if err != nil {
-			return err
+		for i := uint64(0); i < l.log.Len(); i++ {
+			b, err := l.log.Get(i)
+			if err != nil {
+				return err
+			}
+			rec, err := decodeCtl(b, r.n.limits.MaxMessageSize)
+			if err != nil {
+				return err
+			}
+			r.indexRecord(l, i, rec)
+			hasLink = hasLink || rec.Kind == ctlLink && rec.Epoch == v.epoch
+			hasRead = hasRead || rec.Kind == ctlRead && rec.Epoch == v.epoch
 		}
-		if rec.Kind == ctlPut && shared(rec.Key) {
-			r.idx.put(rec.Key, objRef{l, i})
-		}
+		l.applied = l.log.Len()
 	}
-	l.applied = l.log.Len()
 	if r.seg != nil {
 		for i := uint64(0); i < r.seg.log.Len(); i++ {
 			b, err := r.seg.log.Get(i)
@@ -470,7 +583,17 @@ func (r *Room) indexOwn() error {
 			}
 		}
 	}
-	return nil
+	if !v.roles.Admin(r.self) {
+		return nil
+	}
+	errs := []error{r.rotateCtl(v.epoch)}
+	if !hasLink {
+		errs = append(errs, r.writeLink(v))
+	}
+	if !hasRead {
+		errs = append(errs, r.writeRead(v))
+	}
+	return errors.Join(errs...)
 }
 
 func (r *Room) closeLogs() {
@@ -511,6 +634,9 @@ func (r *Room) ID() GroupID { return r.gid }
 
 // Name returns the name the room was created with.
 func (r *Room) Name() string { return r.name }
+
+// Reader reports whether the room was joined with a read link: this device reads it and is no member.
+func (r *Room) Reader() bool { return r.reader }
 
 // Close leaves the room's topic and stops its work; the room's state stays in the stores.
 func (r *Room) Close() error {
@@ -696,12 +822,20 @@ func (r *Room) emit(evs ...Event) {
 
 // Members lists the devices of the room's current epoch, in the order of the tree.
 func (r *Room) Members() []Member {
-	v := r.view.Load()
-	out := make([]Member, len(v.members))
-	for i, m := range v.members {
+	out, _ := r.MembersPage(0, math.MaxInt)
+	return out
+}
+
+// MembersPage returns up to n devices of Members from offset on, and the number of devices in the current epoch.
+func (r *Room) MembersPage(offset, n int) ([]Member, int) {
+	all := r.view.Load().members
+	offset = min(max(offset, 0), len(all))
+	page := all[offset : offset+min(max(n, 0), len(all)-offset)]
+	out := make([]Member, len(page))
+	for i, m := range page {
 		out[i] = Member{Person: slices.Clone(m.Person), Device: slices.Clone(m.Device), Role: m.Role}
 	}
-	return out
+	return out, len(all)
 }
 
 // Status reports the room's state.
@@ -715,7 +849,7 @@ func (r *Room) Status() Status {
 	r.dmu.Lock()
 	perr := r.pinErr
 	r.dmu.Unlock()
-	return Status{Epoch: r.view.Load().epoch, Logs: logs, Receipts: rc, CatchingUp: r.catchingUp(), AdminsOnline: r.adminsOnline(), PinError: perr}
+	return Status{Epoch: r.view.Load().epoch, Logs: logs, Receipts: rc, CatchingUp: r.catchingUp(), AdminsOnline: r.adminsOnline(), Peers: r.peersOnline(), PinError: perr}
 }
 
 func (r *Room) run() {
@@ -761,6 +895,7 @@ func (r *Room) handle(m *kologossip.Message) {
 	if len(m.Body) == 0 {
 		return
 	}
+	r.contact([32]byte(m.Device))
 	if r.reader && m.Body[0] != kindMessage {
 		return
 	}
@@ -768,7 +903,7 @@ func (r *Room) handle(m *kologossip.Message) {
 	case kindMessage:
 		r.receive(m)
 	case kindCommit:
-		r.applyCommit(m)
+		r.hintCommit(m)
 	case kindLeave:
 		r.handleLeave(m)
 	case kindPromote, kindAdminWelcome:
@@ -811,7 +946,7 @@ func (r *Room) receive(m *kologossip.Message) {
 		r.emit(ev)
 		return
 	}
-	if !r.mayPostAt(r.view.Load(), s.Epoch, m.Person, m.Device) {
+	if v := r.view.Load(); !r.mayPostAt(v, s.Epoch, liveAt(v, s.Epoch, r.n.now()), m.Person, m.Device) {
 		ev.Err = ErrNotPoster
 		r.emit(ev)
 		return
@@ -826,9 +961,10 @@ func (r *Room) receive(m *kologossip.Message) {
 	r.release(func() []Event { return r.ord.add(ev, r.n.now()) })
 }
 
-// applyCommit applies a settled Commit that an admin sent.
-func (r *Room) applyCommit(m *kologossip.Message) {
-	c, err := decodeCommit(m.Body)
+// hintCommit keeps the SettledCommit of an announced Commit for the sync loop, which pulls the Commit by its hash. The
+// validator has checked its quorum.
+func (r *Room) hintCommit(m *kologossip.Message) {
+	c, err := decodeCommitRef(m.Body)
 	if err != nil {
 		return
 	}
@@ -836,20 +972,15 @@ func (r *Room) applyCommit(m *kologossip.Message) {
 	if err != nil {
 		return
 	}
-	r.mu.Lock()
-	if r.m.Removed() || r.m.Epoch() != st.TBS.Epoch {
-		r.mu.Unlock()
-		return
-	}
-	_, err = r.m.ApplySettled(c.Settled, c.Commit)
-	var evs []Event
-	if err == nil {
-		evs = r.refreshLocked()
-	} else {
-		evs = []Event{{Kind: MembersChanged, Epoch: st.TBS.Epoch, Err: err}}
-	}
-	r.mu.Unlock()
-	r.applied(evs)
+	r.sawSettled(st.TBS.Epoch, st.TBS.Commit)
+	r.hint.Store(&hint{epoch: st.TBS.Epoch, settled: c.Settled})
+	r.kick()
+}
+
+// hint is the SettledCommit an admin announced for an epoch.
+type hint struct {
+	epoch   uint64
+	settled []byte
 }
 
 // finishRemoval ends Next once a removed device's events are queued, and forgets what the room kept: a device that was
@@ -887,7 +1018,11 @@ func (r *Room) refreshLocked() []Event {
 		return []Event{{Kind: MembersChanged, Err: err}}
 	}
 	// The link goes to the log before the view changes, so no segment of the new epoch comes before it.
-	linkErr := errors.Join(r.notePolicy(v), r.writeLink(v), r.writeRead(v))
+	var rotErr error
+	if v.roles.Admin(r.self) {
+		rotErr = r.rotateCtl(v.epoch)
+	}
+	linkErr := errors.Join(rotErr, r.notePolicy(v), r.writeLink(v), r.writeRead(v))
 	r.view.Store(v)
 	r.notify()
 	r.n.refreshMembers()

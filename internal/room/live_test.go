@@ -16,6 +16,14 @@ import (
 )
 
 // authenticators returns the epoch authenticator of every member.
+// authenticatorOf returns the epoch authenticator of r's member, which the room's goroutines use under r.mu.
+func authenticatorOf(r *Room) []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, _ := r.m.EpochAuthenticator()
+	return a
+}
+
 func (gr *group) authenticators() [][]byte {
 	var out [][]byte
 	for _, r := range gr.rooms {

@@ -24,7 +24,7 @@ func TestStoredRoundTripAndRefusals(t *testing.T) {
 		}
 	}
 	// A body that is not a sealed message is refused, so an entry that holds a Commit message is no message.
-	if _, err := decodeStored((&stored{Body: (&commitMsg{Settled: []byte{1}, Commit: []byte{2}}).encode()}).encode()); !errors.Is(err, ErrMalformed) {
+	if _, err := decodeStored((&stored{Body: (&commitRef{Settled: []byte{1}}).encode()}).encode()); !errors.Is(err, ErrMalformed) {
 		t.Errorf("a stored Commit message: %v", err)
 	}
 }
@@ -85,6 +85,8 @@ func TestControlRecordRoundTripAndRefusals(t *testing.T) {
 		{Kind: ctlDir, Header: []byte("header")},
 		{Kind: ctlLink, Epoch: 40, Value: make([]byte, linkSize)},
 		{Kind: ctlRead, Epoch: 41, Value: []byte("a sealed state")},
+		{Kind: ctlNext, Epoch: 42, Header: []byte("header")},
+		{Kind: ctlPrev, Epoch: 42, Header: []byte("header")},
 	} {
 		got, err := decodeCtl(c.encode(), 1<<10)
 		if err != nil || got.Kind != c.Kind || got.Key != c.Key || !bytes.Equal(got.Value, c.Value) || got.Epoch != c.Epoch || !bytes.Equal(got.Header, c.Header) || got.ID != c.ID || got.Size != c.Size {
@@ -178,7 +180,7 @@ func TestMetaAndLogRecordsRoundTrip(t *testing.T) {
 }
 
 func TestInviteCarriesTheControlLogs(t *testing.T) {
-	v := &invite{Welcome: []byte("w"), Settled: []byte("s"), Tree: []byte("t"), Name: "n", Logs: [][]byte{[]byte("one"), []byte("two")}}
+	v := &invite{Welcome: []byte("w"), Settled: []byte("s"), TreeHeader: []byte("h"), TreeEntries: 1, Name: "n", Logs: [][]byte{[]byte("one"), []byte("two")}}
 	got, err := decodeInvite(v.encode(), 1<<10)
 	if err != nil || len(got.Logs) != 2 || string(got.Logs[1]) != "two" {
 		t.Fatalf("round trip: %+v %v", got, err)
@@ -187,7 +189,7 @@ func TestInviteCarriesTheControlLogs(t *testing.T) {
 	if _, err := decodeInvite(huge, 1<<10); !errors.Is(err, ErrMalformed) {
 		t.Errorf("a count of logs past the bytes that remain: %v", err)
 	}
-	if _, err := decodeInvite((&invite{Welcome: []byte("w"), Settled: []byte("s"), Tree: []byte("t"), Logs: [][]byte{make([]byte, maxHeader+1)}}).encode(), 1<<10); !errors.Is(err, ErrMalformed) {
+	if _, err := decodeInvite((&invite{Welcome: []byte("w"), Settled: []byte("s"), TreeHeader: []byte("h"), TreeEntries: 1, Logs: [][]byte{make([]byte, maxHeader+1)}}).encode(), 1<<10); !errors.Is(err, ErrMalformed) {
 		t.Errorf("a header past the bound: %v", err)
 	}
 }
@@ -214,6 +216,10 @@ func FuzzDecodeCtl(f *testing.F) {
 	f.Add((&ctlRecord{Kind: ctlDir, Header: []byte("h")}).encode())
 	f.Add((&ctlRecord{Kind: ctlLink, Epoch: 9, Value: make([]byte, linkSize)}).encode())
 	f.Add((&ctlRecord{Kind: ctlRead, Epoch: 9, Value: []byte("state")}).encode())
+	f.Add((&ctlRecord{Kind: ctlChunk, ID: [32]byte{1}, Index: 1, Count: 3, Value: []byte("piece")}).encode())
+	f.Add((&ctlRecord{Kind: ctlTree, Epoch: 4, Header: []byte("header")}).encode())
+	f.Add((&ctlRecord{Kind: ctlNext, Epoch: 5, Header: []byte("header")}).encode())
+	f.Add((&ctlRecord{Kind: ctlPrev, Epoch: 5, Header: []byte("header")}).encode())
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if c, err := decodeCtl(b, 1<<12); err == nil && !bytes.Equal(c.encode(), b) {
 			t.Fatal("a control record does not encode back to its bytes")
@@ -236,7 +242,7 @@ func FuzzDecodeAdminMessages(f *testing.F) {
 }
 
 func FuzzDecodeRecords(f *testing.F) {
-	f.Add((&meta{Name: "n", HasCtl: true}).encode(), (&logRec{Header: []byte("h"), Closed: true}).encode())
+	f.Add((&meta{Name: "n", HasCtl: true}).encode(), (&logRec{Header: []byte("h"), Closed: true, Tree: true}).encode())
 	f.Fuzz(func(t *testing.T, m, l []byte) {
 		if v, err := decodeMeta(m); err == nil && !bytes.Equal(v.encode(), m) {
 			t.Fatal("a meta record does not encode back to its bytes")

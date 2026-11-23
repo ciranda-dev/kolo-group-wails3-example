@@ -52,6 +52,9 @@ func (r *Room) adminLoop() {
 		}
 		r.mu.Unlock()
 		if ap != nil {
+			if st, err := settle.DecodeSettled(ap.Settled, 0); err == nil {
+				r.sawSettled(ap.Epoch, st.TBS.Commit)
+			}
 			r.announce(ap)
 			r.applied(evs)
 		}
@@ -70,31 +73,45 @@ func (r *Room) adminLoop() {
 	}
 }
 
-// announce sends a settled Commit to the members on the room's topic.
+// announce tells the members on the room's topic that a Commit settled; they pull it from the control logs.
 func (r *Room) announce(ap *braid.Applied) {
 	_, err := r.publish(r.ctx, func(uint64) ([]byte, error) {
-		return (&commitMsg{Settled: ap.Settled, Commit: ap.Commit}).encode(), nil
+		return (&commitRef{Settled: ap.Settled}).encode(), nil
 	})
 	if err != nil && r.ctx.Err() == nil {
 		r.emit(Event{Kind: MembersChanged, Epoch: ap.Epoch + 1, Err: err})
 	}
 }
 
-// commit makes this admin's Commit of o, waits until it settles and applies, and returns the Welcome of the members it
-// adds and the epoch it was made in.
-func (r *Room) commit(ctx context.Context, o kolomls.CommitOptions) (welcome, settled []byte, epoch uint64, err error) {
+// errNoChange is what a Commit's build returns when the room already is as asked.
+var errNoChange = errors.New("room: no change")
+
+// commit makes this admin's Commit of what build returns for the current view, waits until it settles and applies, and
+// returns the Welcome of the members it adds and the epoch it was made in. build runs under the lock that applies the
+// Commits of the other admins, so what it reads is not stale.
+func (r *Room) commit(ctx context.Context, build func(v *view) (kolomls.CommitOptions, error)) (welcome, settled []byte, epoch uint64, err error) {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
+	r.mu.Lock()
 	if r.admin == nil {
+		r.mu.Unlock()
 		return nil, nil, 0, ErrNotAdmin
 	}
 	if r.removed.Load() {
+		r.mu.Unlock()
 		return nil, nil, 0, ErrRemoved
 	}
-	r.mu.Lock()
+	o, err := build(r.view.Load())
+	if err != nil {
+		r.mu.Unlock()
+		return nil, nil, 0, err
+	}
 	r.stepErr = nil
 	epoch = r.m.Epoch()
-	var hash [32]byte
+	var (
+		hash  [32]byte
+		added [][32]byte
+	)
 	if o.SetExtensions && r.rolesChange(o.Extensions) {
 		// A roles change is small, and the admin checks it against the braid before it commits.
 		if welcome, err = r.admin.Commit(ctx, o); err != nil {
@@ -108,14 +125,9 @@ func (r *Room) commit(ctx context.Context, o kolomls.CommitOptions) (welcome, se
 			r.mu.Unlock()
 			return nil, nil, 0, err
 		}
-		// The Commit and its SettledCommit travel in one gossip message; Commits by reference are not built yet.
-		if len(pc.Commit())+settledBound(len(r.view.Load().roles.Settlers))+64 > r.n.limits.MaxMessageSize-envelopeReserve {
-			err = r.m.DiscardPending()
-			r.mu.Unlock()
-			return nil, nil, 0, errors.Join(ErrTooLarge, err)
-		}
 		hash = sha256.Sum256(pc.Commit())
 		welcome = pc.Welcome()
+		added = r.newDevices(r.m.PendingLeaves())
 		err = r.admin.Reference(ctx)
 	}
 	r.mu.Unlock()
@@ -146,7 +158,65 @@ func (r *Room) commit(ctx context.Context, o kolomls.CommitOptions) (welcome, se
 	if settled, err = r.settledFor(ctx, epoch, hash); err != nil {
 		return nil, nil, 0, err
 	}
+	if err := r.keepWelcome(epoch, added); err != nil {
+		return nil, nil, 0, err
+	}
 	return welcome, settled, epoch, nil
+}
+
+// newDevices returns the devices of leaves that the room does not hold yet.
+func (r *Room) newDevices(leaves []*kolomls.LeafNode) [][32]byte {
+	var out [][32]byte
+	for _, l := range leaves {
+		if c, err := cred.Decode(l.Credential); err == nil && r.view.Load().author([32]byte(c.Device())) == nil {
+			out = append(out, [32]byte(c.Device()))
+		}
+	}
+	return out
+}
+
+// keepWelcome records the devices that the Welcome of epoch is for, until each has made contact.
+func (r *Room) keepWelcome(epoch uint64, devices [][32]byte) error {
+	r.wmu.Lock()
+	defer r.wmu.Unlock()
+	for _, d := range devices {
+		if err := r.kv.put(be(epoch), recWelcome, d[:]); err != nil {
+			return err
+		}
+		r.welcomed[d] = epoch
+	}
+	return nil
+}
+
+// contact takes a Welcome as used once the device it is for sends a message: the tree it named then leaves this admin
+// unless it is the latest (braid.Admin.ReleaseWelcome). A device that only connects may still be pulling the tree.
+func (r *Room) contact(device [32]byte) {
+	r.wmu.Lock()
+	epoch, ok := r.welcomed[device]
+	if !ok {
+		r.wmu.Unlock()
+		return
+	}
+	delete(r.welcomed, device)
+	r.kv.del(recWelcome, device[:])
+	last := true
+	for _, e := range r.welcomed {
+		last = last && e != epoch
+	}
+	r.wmu.Unlock()
+	if !last {
+		return
+	}
+	var err error
+	r.mu.Lock()
+	if r.admin != nil {
+		err = r.admin.ReleaseWelcome(r.ctx, epoch)
+	}
+	r.mu.Unlock()
+	// The event goes out after the lock: a full event queue must not hold the admin loop.
+	if err != nil && r.ctx.Err() == nil {
+		r.emit(Event{Kind: MembersChanged, Err: fmt.Errorf("room: releasing the Welcome of epoch %d: %w", epoch, err)})
+	}
 }
 
 // rolesChange reports whether extensions change the room's roles, which the admin checks against the braid; a change of the
@@ -165,7 +235,7 @@ func (r *Room) Add(ctx context.Context, keyPackages ...[]byte) (welcome []byte, 
 	if len(keyPackages) == 0 {
 		return nil, errInvalid("no key package")
 	}
-	w, settled, epoch, err := r.commit(ctx, kolomls.CommitOptions{Add: keyPackages})
+	w, settled, epoch, err := r.commit(ctx, func(*view) (kolomls.CommitOptions, error) { return kolomls.CommitOptions{Add: keyPackages}, nil })
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +251,11 @@ func (r *Room) Add(ctx context.Context, keyPackages ...[]byte) (welcome []byte, 
 	if err != nil {
 		return nil, err
 	}
-	return (&invite{Welcome: w, Settled: settled, Tree: tree, Secret: r.secret, Name: r.name, Logs: r.controlHeaders()}).encode(), nil
+	header, entries, err := r.writeTree(epoch+1, tree)
+	if err != nil {
+		return nil, err
+	}
+	return (&invite{Welcome: w, Settled: settled, TreeHeader: header, TreeEntries: entries, TreeHash: sha256.Sum256(tree), Secret: r.secret, Name: r.name, Logs: r.controlHeaders()}).encode(), nil
 }
 
 // controlHeaders returns the signed headers of the control logs of the room's admins that this device holds.
@@ -190,7 +264,7 @@ func (r *Room) controlHeaders() [][]byte {
 	defer r.logMu.Unlock()
 	var out [][]byte
 	for _, l := range r.logs {
-		if l.ctl {
+		if l.ctl && !l.done && !l.past {
 			out = append(out, l.header)
 		}
 	}
@@ -203,24 +277,18 @@ func (r *Room) Remove(ctx context.Context, person ed25519.PublicKey) error {
 	if r.reader {
 		return ErrNotAdmin
 	}
-	r.mu.Lock()
-	var leaves []uint32
-	t := r.m.Tree()
-	for _, l := range t.Members() {
-		c, err := cred.Decode(t.Leaf(l).Credential)
-		if err != nil {
-			r.mu.Unlock()
-			return err
+	_, _, _, err := r.commit(ctx, func(v *view) (kolomls.CommitOptions, error) {
+		var leaves []uint32
+		for i, m := range v.members {
+			if bytes.Equal(m.Person, person) {
+				leaves = append(leaves, v.leaves[i])
+			}
 		}
-		if bytes.Equal(c.Person(), person) {
-			leaves = append(leaves, l)
+		if len(leaves) == 0 {
+			return kolomls.CommitOptions{}, fmt.Errorf("%w: no device of this person", ErrNotMember)
 		}
-	}
-	r.mu.Unlock()
-	if len(leaves) == 0 {
-		return fmt.Errorf("%w: no device of this person", ErrNotMember)
-	}
-	_, _, _, err := r.commit(ctx, kolomls.CommitOptions{Remove: leaves})
+		return kolomls.CommitOptions{Remove: leaves}, nil
+	})
 	return err
 }
 

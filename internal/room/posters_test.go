@@ -183,7 +183,8 @@ func TestSetPolicyHoldsFromTheNextEpochAndNotBefore(t *testing.T) {
 	waitFor(t, 20*time.Second, "the message under the policy that lets everyone post", func() bool { return gr.recs[0].has("again") })
 }
 
-// The policy of each epoch is kept across a restart, so an old message is judged by its own epoch's policy.
+// The policy of each epoch is kept across a restart, so a stored message is judged by its own epoch's policy; the window of
+// the epoch before ends with the restart, so a live message of that epoch is judged by the current policy too.
 func TestPolicyOfEachEpochSurvivesARestart(t *testing.T) {
 	gr := newGroup(t, 2, Limits{})
 	gr.waitMesh(1)
@@ -199,8 +200,11 @@ func TestPolicyOfEachEpochSurvivesARestart(t *testing.T) {
 	fresh := sealAs(t, gr.rooms[0], gr.nodes[1], e+1, gr.rooms[1].seq.Add(1), "new")
 	for _, i := range []int{0, 1} {
 		r := gr.restart(i)
-		if err := r.check(old); err != nil {
-			t.Errorf("member %d, a message of the epoch before: %v", i, err)
+		if !r.mayPostAt(r.view.Load(), e, storedAt(e, e+1), gr.nodes[1].person.PublicKey(), gr.nodes[1].key()) {
+			t.Errorf("member %d, a stored message of the epoch before is refused", i)
+		}
+		if err := r.check(old); !errors.Is(err, ErrNotPoster) {
+			t.Errorf("member %d, a live message of the epoch before, past its window: %v", i, err)
 		}
 		if err := r.check(fresh); !errors.Is(err, ErrNotPoster) {
 			t.Errorf("member %d, a message of the new epoch: %v", i, err)
@@ -208,8 +212,8 @@ func TestPolicyOfEachEpochSurvivesARestart(t *testing.T) {
 	}
 }
 
-// A policy whose Commit does not fit one gossip message is refused before it is made, and the room goes on.
-func TestSetPolicyRefusesAPolicyThatDoesNotFit(t *testing.T) {
+// A policy whose Commit is far past one gossip message still reaches the members, by reference.
+func TestSetPolicyWithACommitPastOneGossipMessage(t *testing.T) {
 	gr := newGroupWith(t, 2, Limits{MaxMessageSize: 64 << 10}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -220,13 +224,13 @@ func TestSetPolicyRefusesAPolicyThatDoesNotFit(t *testing.T) {
 		posters = append(posters, k)
 	}
 	e := gr.rooms[0].Status().Epoch
-	if err := gr.rooms[0].SetPolicy(ctx, Policy{Posters: posters}); !errors.Is(err, ErrTooLarge) {
+	if err := gr.rooms[0].SetPolicy(ctx, Policy{Posters: posters}); err != nil {
 		t.Fatalf("SetPolicy: %v", err)
 	}
-	if err := gr.rooms[0].SetPolicy(ctx, Policy{AdminsPost: true}); err != nil {
-		t.Fatalf("the room does not go on: %v", err)
-	}
 	gr.waitEpoch(e + 1)
+	if got := len(gr.rooms[1].view.Load().pol.persons); got != 3000 {
+		t.Fatalf("the member holds %d posters", got)
+	}
 }
 
 // A history rule set by a Commit holds from the next epoch: epochs that had no links stay closed, and a joiner reads back

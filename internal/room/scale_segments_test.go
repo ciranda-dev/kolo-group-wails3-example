@@ -132,8 +132,7 @@ func scaleCatchUp(t *testing.T, n, total int) {
 		if errs := catchUpErrors(gr.recs[i]); len(errs) > 0 {
 			t.Fatalf("%s: %d reports, the first: %v", what, len(errs), errs[0].Err)
 		}
-		a0, _ := gr.rooms[0].m.EpochAuthenticator()
-		ai, _ := gr.rooms[i].m.EpochAuthenticator()
+		a0, ai := authenticatorOf(gr.rooms[0]), authenticatorOf(gr.rooms[i])
 		if gr.rooms[0].removed.Load() == false && string(a0) != string(ai) && !gr.away[0] {
 			t.Fatalf("%s: another epoch authenticator", what)
 		}

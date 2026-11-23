@@ -59,8 +59,24 @@ func (r *Room) handleLeave(m *kologossip.Message) {
 	if !r.isAdmin() || r.leaveActor() != [32]byte(r.self) {
 		return
 	}
+	if len(m.Person) != 32 {
+		return
+	}
 	person := bytes.Clone(m.Person)
+	// One removal at a time for a person: the requests sent again while it settles are dropped.
+	r.leaveMu.Lock()
+	_, pending := r.leaving[[32]byte(person)]
+	r.leaving[[32]byte(person)] = struct{}{}
+	r.leaveMu.Unlock()
+	if pending {
+		return
+	}
 	r.wg.Go(func() {
+		defer func() {
+			r.leaveMu.Lock()
+			delete(r.leaving, [32]byte(person))
+			r.leaveMu.Unlock()
+		}()
 		ctx, cancel := context.WithTimeout(r.ctx, r.n.limits.CatchUpWait)
 		defer cancel()
 		if err := r.Remove(ctx, person); err != nil && r.ctx.Err() == nil && !errors.Is(err, ErrNotMember) {
