@@ -281,16 +281,23 @@ func (r *Room) SetPolicy(ctx context.Context, p Policy) error {
 	if r.reader {
 		return ErrNotAdmin
 	}
-	if _, err := p.build(nil); err != nil {
+	same := func(v *view) (*roomPolicy, bool, error) {
+		np, err := p.build(v.pol)
+		if err != nil {
+			return nil, false, err
+		}
+		np.hist = v.pol.hist.next(np.hist, v.epoch)
+		return np, bytes.Equal(np.encode(), v.pol.encode()), nil
+	}
+	if _, eq, err := same(r.view.Load()); err != nil || eq {
 		return err
 	}
 	_, _, _, err := r.commit(ctx, func(v *view) (kolomls.CommitOptions, error) {
-		np, err := p.build(v.pol)
-		if err != nil {
+		np, eq, err := same(v)
+		switch {
+		case err != nil:
 			return kolomls.CommitOptions{}, err
-		}
-		np.hist = v.pol.hist.next(np.hist, v.epoch)
-		if bytes.Equal(np.encode(), v.pol.encode()) {
+		case eq:
 			return kolomls.CommitOptions{}, errNoChange
 		}
 		exts, err := groupExtensions(v.roles, np)
