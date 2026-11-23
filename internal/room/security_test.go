@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"net/netip"
 	"runtime"
 	"strings"
@@ -14,9 +15,11 @@ import (
 
 	kologossip "github.com/ciranda-dev/kolo-gossip"
 	koloid "github.com/ciranda-dev/kolo-id"
+	kololog "github.com/ciranda-dev/kolo-log"
 	"github.com/ciranda-dev/kolo-mls/settle"
 	kolostore "github.com/ciranda-dev/kolo-store"
 	koloswarm "github.com/ciranda-dev/kolo-swarm"
+	kolosync "github.com/ciranda-dev/kolo-sync"
 )
 
 // A member that may not post under the current policy cannot post by sealing under the key of an epoch before the
@@ -301,12 +304,25 @@ func TestTreeLogIsNotServedToReadersOrAfterItsEpoch(t *testing.T) {
 	z := newTNode(t, tnodeOpts{server: server, limits: lim})
 	wz, inv := addFor(t, ctx, admin, z)
 	waitFor(t, 30*time.Second, "the reader and the member connected to the admin", func() bool {
-		return x.n.syncConn(s.key()) != nil && x.n.syncConn(y.key()) != nil && x.n.syncConn(y2.key()) != nil
+		return s.n.syncConn(x.key()) != nil && y.n.syncConn(x.key()) != nil && y2.n.syncConn(x.key()) != nil
 	})
+	hd, err := kololog.DecodeLogHeader(inv.TreeHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A pull over the device's connection to the admin, into a store of its own, asks the admin's rule and nothing else.
 	fetch := func(nd *tnode, d time.Duration) error {
 		fctx, fcancel := context.WithTimeout(ctx, d)
 		defer fcancel()
-		_, err := nd.n.fetchTree(fctx, inv)
+		rep, err := kolostore.New(kolostore.NewMemory()).OpenReplica(hd.LogKey, hd.LogID, inv.TreeHeader)
+		if err != nil {
+			return err
+		}
+		defer rep.Close()
+		err = kolosync.PullCiphertext(fctx, nd.n.syncConn(x.key()), rep)
+		if err == nil && rep.Len() < inv.TreeEntries {
+			err = fmt.Errorf("%d of %d entries", rep.Len(), inv.TreeEntries)
+		}
 		return err
 	}
 	if err := fetch(s, 3*time.Second); err == nil {
