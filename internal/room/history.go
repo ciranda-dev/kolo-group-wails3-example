@@ -542,10 +542,9 @@ func (r *Room) allRead(logs []*roomLog) bool {
 		if keyed < n || closed && n < size {
 			return false
 		}
-		if !closed {
-			if st, err := r.fol.Status(l.owner[:], l.id); err != nil || st.Largest == 0 || st.Largest > st.Len {
-				return false
-			}
+		// A peer may offer more than the admin declared, which is read and reported too.
+		if st, err := r.fol.Status(l.owner[:], l.id); err != nil || !closed && st.Largest == 0 || st.Largest > st.Len {
+			return false
 		}
 	}
 	return true
