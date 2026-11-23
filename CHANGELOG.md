@@ -77,3 +77,4 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `followPin` reads whether a replica still lacks entries under the room's log lock; it read the closed flag and size that the sync loop writes without it, a data race.
 - An admin reports a Welcome it could not release after it lets go of the room's lock: with a full event queue the report held the lock and stopped the admin's Commits until `Next` was read.
 - The validator takes the sender's rate token before it checks the author signature of a message and the settler signatures of an announcement, so a device that floods is refused before it costs signature checks.
+- An admin starts one removal at a time for a person that asks to leave and drops the requests sent again meanwhile; each request started a goroutine that decoded the whole tree under the room's lock and waited for the commit lock.

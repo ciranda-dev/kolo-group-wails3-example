@@ -218,6 +218,9 @@ type Room struct {
 	promoMu   sync.Mutex
 	promoting map[[32]byte]chan *adminRequest // devices this admin offered the role to
 
+	leaveMu sync.Mutex
+	leaving map[[32]byte]struct{} // persons whose removal this admin is making
+
 	rmu  sync.Mutex
 	rcpt map[MessageID]*receipt
 
@@ -261,7 +264,7 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 		out: newLimiter(n.limits.Rate*4/5, max(1, n.limits.Burst-1)), ord: newOrderer(n.cfg.Device.PublicKey(), n.limits), seen: newIDSet(n.limits.MaxKnown), events: make(chan Event, n.limits.EventQueue),
 		adminKick: make(chan struct{}, 1), syncKick: make(chan struct{}, 1), pushKick: make(chan struct{}, 1),
 		kv: kv, logSec: sec, logs: map[logKey]*roomLog{}, dirs: map[[32]byte][]byte{}, rcpt: map[MessageID]*receipt{}, welcomed: map[[32]byte]uint64{},
-		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, badCommits: map[[32]byte]struct{}{}, settledIn: map[uint64]*seenCommit{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, first: map[[32]byte]uint64{}, joinEpoch: v.epoch,
+		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, leaving: map[[32]byte]struct{}{}, badCommits: map[[32]byte]struct{}{}, settledIn: map[uint64]*seenCommit{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, first: map[[32]byte]uint64{}, joinEpoch: v.epoch,
 		links: map[uint64][]linkRec{}, past: map[uint64][]*pastSeg{}, pastBy: map[logKey]*pastSeg{}}
 	if readKey != nil {
 		r.reader, r.readKey = true, *readKey

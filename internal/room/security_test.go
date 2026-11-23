@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -452,4 +453,21 @@ func TestRateIsCheckedBeforeTheSignatures(t *testing.T) {
 	if err := member.check(ref); !errors.Is(err, ErrRate) {
 		t.Fatalf("an unsigned announcement over the rate: %v", err)
 	}
+}
+
+// Requests to leave sent again and again while the removal settles start one removal.
+func TestRepeatedLeaveRequestsStartOneRemoval(t *testing.T) {
+	gr := newGroup(t, 2, Limits{})
+	gr.waitMesh(1)
+	admin := gr.rooms[0]
+	m := &kologossip.Message{Person: gr.nodes[1].person.PublicKey(), Device: gr.nodes[1].key(), Body: []byte{kindLeave}}
+	before := runtime.NumGoroutine()
+	for range 200 {
+		admin.handleLeave(m)
+	}
+	if n := runtime.NumGoroutine() - before; n > 20 {
+		t.Fatalf("200 requests started %d goroutines", n)
+	}
+	gr.waitEpoch(admin.Status().Epoch)
+	waitFor(t, 30*time.Second, "the removal", func() bool { return len(admin.Members()) == 1 })
 }
