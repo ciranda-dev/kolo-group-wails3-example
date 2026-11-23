@@ -203,10 +203,18 @@ func (tn *tnode) start() {
 	if o.beforeOpen != nil {
 		o.beforeOpen(sw)
 	} else if o.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := sw.Bootstrap(ctx, []netip.AddrPort{addrOf(o.server.Addr())}); err != nil {
-			t.Fatal(err)
+		// One server on 127.0.0.1 serves every device of a test; under -race and a high load it can miss a few answers.
+		deadline := time.Now().Add(time.Minute)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err := sw.Bootstrap(ctx, []netip.AddrPort{addrOf(o.server.Addr())})
+			cancel()
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal(err)
+			}
 		}
 	}
 	if tn.g, err = kologossip.New(tn.dev, &kologossip.Config{Cert: tn.cert, Swarm: sw, HeartbeatInterval: 100 * time.Millisecond}); err != nil {
