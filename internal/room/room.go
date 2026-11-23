@@ -124,9 +124,6 @@ type Event struct {
 	Err     error
 }
 
-// envelopeReserve bounds what gossip's envelope adds to a body; TestEnvelopeOverhead measures 178 bytes.
-const envelopeReserve = 256
-
 // Room is one group.
 type Room struct {
 	n       *Node
@@ -204,6 +201,9 @@ type Room struct {
 	hlast  MessageID  // the oldest message of the last page
 	hseen  *idSet
 
+	wmu      sync.Mutex
+	welcomed map[[32]byte]uint64 // the devices this admin added that have not made contact, with the epoch of their Welcome
+
 	ctlMu sync.Mutex // orders the appends to the control log
 	segMu sync.Mutex // guards seg and orders the appends to it
 	seg   *roomLog
@@ -214,6 +214,7 @@ type Room struct {
 	rmu  sync.Mutex
 	rcpt map[MessageID]*receipt
 
+	hint     atomic.Pointer[hint]
 	progress atomic.Int64 // when a log last grew or was read, in Unix nanoseconds
 	pinMu    sync.Mutex
 	pinSince time.Time
@@ -252,7 +253,7 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 		gone: make(chan struct{}), keys: map[uint64][keySize]byte{v.epoch: v.key}, rate: newLimiter(n.limits.Rate, n.limits.Burst),
 		out: newLimiter(n.limits.Rate*4/5, max(1, n.limits.Burst-1)), ord: newOrderer(n.cfg.Device.PublicKey(), n.limits), seen: newIDSet(n.limits.MaxKnown), events: make(chan Event, n.limits.EventQueue),
 		adminKick: make(chan struct{}, 1), syncKick: make(chan struct{}, 1), pushKick: make(chan struct{}, 1),
-		kv: kv, logSec: sec, logs: map[logKey]*roomLog{}, dirs: map[[32]byte][]byte{}, rcpt: map[MessageID]*receipt{},
+		kv: kv, logSec: sec, logs: map[logKey]*roomLog{}, dirs: map[[32]byte][]byte{}, rcpt: map[MessageID]*receipt{}, welcomed: map[[32]byte]uint64{},
 		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, badCommits: map[[32]byte]struct{}{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, joinEpoch: v.epoch,
 		links: map[uint64][]linkRec{}, past: map[uint64][]*pastSeg{}, pastBy: map[logKey]*pastSeg{}}
 	if readKey != nil {
@@ -363,6 +364,15 @@ func (r *Room) restore(v *view) error {
 	if err := r.loadReceipts(); err != nil {
 		return err
 	}
+	if err := r.kv.each(recWelcome, func(tail, v []byte) error {
+		if len(tail) != 32 || len(v) != 8 {
+			return fmt.Errorf("%w: welcome record", ErrMalformed)
+		}
+		r.welcomed[[32]byte(tail)] = unbe(v)
+		return nil
+	}); err != nil {
+		return err
+	}
 	return r.reopenLogs()
 }
 
@@ -402,19 +412,20 @@ func (r *Room) reopenLogs() error {
 	for _, x := range recs {
 		var l *roomLog
 		var err error
-		if !x.r.Ctl && !x.r.Own && x.r.Epoch < r.joinEpoch {
+		if !x.r.Ctl && !x.r.Own && (x.r.Epoch < r.joinEpoch || x.r.Tree && x.r.Epoch < r.view.Load().epoch) {
 			r.n.cfg.Store.Delete(x.id)
 			r.kv.del(recLog, x.owner[:], x.id[:])
 			continue
 		}
 		if x.r.Own {
 			if l, err = r.openLog(x.r.Ctl, x.r.Epoch, &x.id); err == nil {
+				l.tree = x.r.Tree
 				r.logMu.Lock()
 				err = r.trackLocked(l)
 				r.logMu.Unlock()
 			}
 		} else {
-			l, err = r.replicate(x.owner, x.r.Header, x.r.Ctl, x.r.Epoch)
+			l, err = r.replicateKind(x.owner, x.r.Header, x.r.Ctl, x.r.Tree, x.r.Epoch)
 		}
 		if err != nil {
 			return fmt.Errorf("room: reopening a log: %w", err)
@@ -424,7 +435,7 @@ func (r *Room) reopenLogs() error {
 		if l.own && l.ctl {
 			r.ctl = l
 		}
-		if l.own && !l.ctl && !l.closed {
+		if l.own && !l.ctl && !l.tree && !l.closed {
 			r.seg = l
 		}
 		r.logMu.Unlock()
@@ -454,9 +465,7 @@ func (r *Room) indexOwn() error {
 		if err != nil {
 			return err
 		}
-		if rec.Kind == ctlPut && shared(rec.Key) {
-			r.idx.put(rec.Key, objRef{l, i})
-		}
+		r.indexRecord(l, i, rec)
 	}
 	l.applied = l.log.Len()
 	if r.seg != nil {
@@ -759,6 +768,7 @@ func (r *Room) handle(m *kologossip.Message) {
 	if len(m.Body) == 0 {
 		return
 	}
+	r.contact([32]byte(m.Device))
 	if r.reader && m.Body[0] != kindMessage {
 		return
 	}
@@ -766,7 +776,7 @@ func (r *Room) handle(m *kologossip.Message) {
 	case kindMessage:
 		r.receive(m)
 	case kindCommit:
-		r.applyCommit(m)
+		r.hintCommit(m)
 	case kindLeave:
 		r.handleLeave(m)
 	case kindPromote, kindAdminWelcome:
@@ -824,9 +834,9 @@ func (r *Room) receive(m *kologossip.Message) {
 	r.release(func() []Event { return r.ord.add(ev, r.n.now()) })
 }
 
-// applyCommit applies a settled Commit that an admin sent.
-func (r *Room) applyCommit(m *kologossip.Message) {
-	c, err := decodeCommit(m.Body)
+// hintCommit keeps the SettledCommit of an announced Commit for the sync loop, which pulls the Commit by its hash.
+func (r *Room) hintCommit(m *kologossip.Message) {
+	c, err := decodeCommitRef(m.Body)
 	if err != nil {
 		return
 	}
@@ -834,20 +844,14 @@ func (r *Room) applyCommit(m *kologossip.Message) {
 	if err != nil {
 		return
 	}
-	r.mu.Lock()
-	if r.m.Removed() || r.m.Epoch() != st.TBS.Epoch {
-		r.mu.Unlock()
-		return
-	}
-	_, err = r.m.ApplySettled(c.Settled, c.Commit)
-	var evs []Event
-	if err == nil {
-		evs = r.refreshLocked()
-	} else {
-		evs = []Event{{Kind: MembersChanged, Epoch: st.TBS.Epoch, Err: err}}
-	}
-	r.mu.Unlock()
-	r.applied(evs)
+	r.hint.Store(&hint{epoch: st.TBS.Epoch, settled: c.Settled})
+	r.kick()
+}
+
+// hint is the SettledCommit an admin announced for an epoch.
+type hint struct {
+	epoch   uint64
+	settled []byte
 }
 
 // finishRemoval ends Next once a removed device's events are queued, and forgets what the room kept: a device that was

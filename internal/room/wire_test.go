@@ -63,24 +63,18 @@ func TestDecodersRefuseTruncatedAndHostileInput(t *testing.T) {
 	if _, err := decodeSealed((&sealed{Nonce: [nonceSize]byte{}}).encode()); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("an empty ciphertext: %v", err)
 	}
-	for _, b := range [][]byte{nil, {kindCommit}, {kindCommit, 0, 0}, {kindCommit, 5, 1}, {kindMessage, 1, 1, 1, 1}} {
-		if _, err := decodeCommit(b); !errors.Is(err, ErrMalformed) {
-			t.Fatalf("commit %x: %v", b, err)
+	for _, b := range [][]byte{nil, {kindCommit}, {kindMessage, 1, 1, 1, 1}} {
+		if _, err := decodeCommitRef(b); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("commit announcement %x: %v", b, err)
 		}
-	}
-	if _, err := decodeCommit(append((&commitMsg{Settled: []byte{1}, Commit: []byte{2}}).encode(), 9)); !errors.Is(err, ErrMalformed) {
-		t.Fatalf("a commit message with trailing bytes: %v", err)
 	}
 }
 
 func TestInviteRoundTripAndBounds(t *testing.T) {
-	v := &invite{Welcome: []byte("w"), Settled: []byte("s"), Tree: []byte("tree"), Secret: [keySize]byte{9}, Name: "room"}
+	v := &invite{Welcome: []byte("w"), Settled: []byte("s"), TreeHeader: []byte("h"), TreeEntries: 3, TreeHash: [32]byte{5}, Secret: [keySize]byte{9}, Name: "room"}
 	got, err := decodeInvite(v.encode(), 1<<20)
-	if err != nil || string(got.Welcome) != "w" || string(got.Tree) != "tree" || got.Secret != v.Secret || got.Name != "room" {
+	if err != nil || string(got.Welcome) != "w" || string(got.TreeHeader) != "h" || got.TreeEntries != 3 || got.TreeHash != v.TreeHash || got.Secret != v.Secret || got.Name != "room" {
 		t.Fatalf("round trip: %+v %v", got, err)
-	}
-	if _, err := decodeInvite(v.encode(), 2); !errors.Is(err, ErrMalformed) && len("tree") > 2+64 {
-		t.Fatalf("a tree past the bound: %v", err)
 	}
 	long := *v
 	long.Name = string(bytes.Repeat([]byte("n"), maxName+1))
@@ -90,10 +84,14 @@ func TestInviteRoundTripAndBounds(t *testing.T) {
 	if _, err := decodeInvite(append(v.encode(), 0), 1<<20); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("trailing bytes: %v", err)
 	}
+	// A tree log longer than the bound on the tree allows is refused before anything is pulled.
 	big := *v
-	big.Tree = make([]byte, 200)
-	if _, err := decodeInvite(big.encode(), 100); !errors.Is(err, ErrMalformed) {
-		t.Fatalf("a tree of 200 bytes under a bound of 100: %v", err)
+	big.TreeEntries = 100
+	if _, err := decodeInvite(big.encode(), 3*maxChunk); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("100 pieces under a bound of 3 MiB: %v", err)
+	}
+	if _, err := decodeInvite((&invite{TreeHeader: make([]byte, maxHeader+1)}).encode(), 1<<20); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a long tree log header: %v", err)
 	}
 }
 
@@ -150,17 +148,17 @@ func FuzzDecodeContent(f *testing.F) {
 	})
 }
 
-func FuzzDecodeCommit(f *testing.F) {
-	f.Add((&commitMsg{Settled: []byte{1}, Commit: []byte{2}}).encode())
+func FuzzDecodeCommitRef(f *testing.F) {
+	f.Add((&commitRef{Settled: []byte{1}}).encode())
 	f.Fuzz(func(t *testing.T, b []byte) {
-		if c, err := decodeCommit(b); err == nil && !bytes.Equal(c.encode(), b) {
-			t.Fatal("a commit message that decodes does not encode back to itself")
+		if c, err := decodeCommitRef(b); err == nil && !bytes.Equal(c.encode(), b) {
+			t.Fatal("a commit announcement that decodes does not encode back to itself")
 		}
 	})
 }
 
 func FuzzDecodeInvite(f *testing.F) {
-	f.Add((&invite{Welcome: []byte("w"), Settled: []byte("s"), Tree: []byte("t"), Name: "n"}).encode())
+	f.Add((&invite{Welcome: []byte("w"), Settled: []byte("s"), TreeHeader: []byte("h"), TreeEntries: 1, Name: "n"}).encode())
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if v, err := decodeInvite(b, 1<<16); err == nil && !bytes.Equal(v.encode(), b) {
 			t.Fatal("an invite that decodes does not encode back to itself")

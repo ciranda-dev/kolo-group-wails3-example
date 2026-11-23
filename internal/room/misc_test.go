@@ -120,7 +120,10 @@ func TestJoinRefusesABadOrUsedWelcome(t *testing.T) {
 		t.Fatalf("no welcome: %v", err)
 	}
 	other := newTNode(t, tnodeOpts{server: gr.server})
-	if _, err := other.n.Join(ctx, w); err == nil {
+	// The devices of the room do not serve it a tree, so it waits for one until its context ends.
+	octx, stop := context.WithTimeout(ctx, 3*time.Second)
+	defer stop()
+	if _, err := other.n.Join(octx, w); err == nil {
 		t.Fatal("a device joined with a welcome made for another device")
 	}
 	r, err := nd.n.Join(ctx, w)

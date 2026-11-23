@@ -15,6 +15,8 @@ import (
 	"time"
 
 	kololog "github.com/ciranda-dev/kolo-log"
+	kolosecure "github.com/ciranda-dev/kolo-secure"
+	kolostore "github.com/ciranda-dev/kolo-store"
 	kolosync "github.com/ciranda-dev/kolo-sync"
 
 	kologossip "github.com/ciranda-dev/kolo-gossip"
@@ -38,7 +40,8 @@ type Node struct {
 	conns   map[[32]byte][]koloswarm.Conn
 	links   map[*connState]struct{}
 	members atomic.Pointer[map[[32]byte]struct{}]
-	open    atomic.Bool // a room has a read link or is one: any device is admitted
+	open    atomic.Bool  // a room has a read link or is one: any device is admitted
+	joining atomic.Int32 // joins that are fetching their tree: any device is admitted, since nothing tells a joiner who serves it
 	closed  bool
 }
 
@@ -151,13 +154,14 @@ func (n *Node) isMember(key []byte) bool {
 		return false
 	}
 	_, ok := (*n.members.Load())[[32]byte(key)]
-	return ok || n.open.Load()
+	return ok || n.open.Load() || n.joining.Load() > 0
 }
 
-// readableBy reports whether a device may read the room's logs: a member, or anyone when the room has a read link.
+// readableBy reports whether a device may read the room's logs: a member, a device removed by the last Commit while its window
+// lasts, since it pulls that Commit from the logs, or anyone when the room has a read link.
 func (r *Room) readableBy(dev [32]byte) bool {
 	v := r.view.Load()
-	return r.reader || v.pol.link || v.author(dev) != nil
+	return r.reader || v.pol.link || v.author(dev) != nil || v.prev != nil && r.n.now().Before(v.prevUntil) && v.prev.author(dev) != nil
 }
 
 // Allow is the admission rule for koloswarm.Config.Allow: only devices that are leaves of a room of this node, and
@@ -363,17 +367,23 @@ func (n *Node) Create(ctx context.Context, name string, p Policy) (*Room, error)
 	return r, nil
 }
 
-// Join enters a room from the welcome that an admin's Add returned for a key package of this node.
+// Join enters a room from the welcome that an admin's Add returned for a key package of this node. It pulls the sealed tree
+// from the devices of the room that are online, and from the pins when none gives it; the tree must hash to what the welcome
+// says and open with the Welcome's keys.
 func (n *Node) Join(ctx context.Context, welcome []byte) (*Room, error) {
 	inv, err := decodeInvite(welcome, n.limits.MaxTreeBytes)
 	if err != nil {
 		return nil, err
 	}
+	sealed, err := n.fetchTree(ctx, inv)
+	if err != nil {
+		return nil, err
+	}
 	tree := func(_ []byte, _ uint64, max int) ([]byte, error) {
-		if max > 0 && len(inv.Tree) > max {
+		if max > 0 && len(sealed) > max {
 			return nil, settle.ErrPinTooLarge
 		}
-		return inv.Tree, nil
+		return sealed, nil
 	}
 	m, err := settle.JoinMember(n.cfg.MLSStore, inv.Welcome, inv.Settled, tree, kolomls.JoinOptions{Config: n.mlsConfig(), MaxTreeBytes: n.limits.MaxTreeBytes}, settle.MemberOptions{})
 	if err != nil {
@@ -428,4 +438,116 @@ func topicOf(secret [keySize]byte) kologossip.Topic {
 	h.Write([]byte(topicLabel))
 	h.Write(secret[:])
 	return kologossip.Topic(h.Sum(nil))
+}
+
+// syncConns returns the kolo-sync part of every connection being served.
+func (n *Node) syncConns() []kolosync.Conn {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var out []kolosync.Conn
+	for cs := range n.links {
+		if !cs.done {
+			out = append(out, cs.mux.sync)
+		}
+	}
+	return out
+}
+
+// fetchTree pulls the sealed tree that an invite names into a replica of its log, from the connections of this node, those
+// that a lookup of the room's topic brings, and then from the pins, and returns it once it hashes to what the invite says.
+func (n *Node) fetchTree(ctx context.Context, inv *invite) ([]byte, error) {
+	hd, err := kololog.DecodeLogHeader(inv.TreeHeader)
+	if err != nil || len(hd.LogKey) != ed25519.PublicKeySize || inv.TreeEntries == 0 {
+		return nil, fmt.Errorf("%w: %w: the log header", ErrTree, ErrMalformed)
+	}
+	sec, err := logSecret(&inv.Secret)
+	if err != nil {
+		return nil, err
+	}
+	rep, err := n.cfg.Store.OpenReplica(hd.LogKey, hd.LogID, inv.TreeHeader)
+	if err != nil {
+		return nil, err
+	}
+	l := &roomLog{rep: rep, view: rep}
+	if l.deriver, err = kololog.NewKeyDeriver(sec, hd.LogKey, rep.Header()); err != nil {
+		rep.Close()
+		return nil, err
+	}
+	defer func() {
+		l.close()
+		n.cfg.Store.Delete(hd.LogID)
+	}()
+	n.joining.Add(1)
+	defer n.joining.Add(-1)
+	topic := topicOf(inv.Secret)
+	lookup := func() {
+		if sw := n.cfg.Swarm; sw != nil {
+			sw.Leave(topic)
+			sw.Join(ctx, topic, &koloswarm.JoinOptions{Lookup: true})
+		}
+	}
+	lookup()
+	if sw := n.cfg.Swarm; sw != nil {
+		defer sw.Leave(topic)
+	}
+	start, looked := time.Now(), time.Now()
+	for rep.Len() < inv.TreeEntries {
+		cs := n.syncConns()
+		if len(cs) == 0 && time.Since(looked) >= time.Second {
+			lookup()
+			looked = time.Now()
+		}
+		for _, c := range cs {
+			n.pullTree(ctx, c, rep, inv.TreeEntries)
+		}
+		if rep.Len() < inv.TreeEntries && time.Since(start) >= n.limits.PinWait {
+			n.pullTreeFromPins(ctx, rep, inv.TreeEntries)
+		}
+		if rep.Len() >= inv.TreeEntries {
+			break
+		}
+		select {
+		case <-time.After(50 * time.Millisecond):
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%w: %d of %d pieces: %w", ErrTree, rep.Len(), inv.TreeEntries, ctx.Err())
+		}
+	}
+	if err := l.deriveKeys(); err != nil {
+		return nil, err
+	}
+	sealed, err := readPieces(rep, 0, inv.TreeHash, n.limits.MaxTreeBytes+sealedTreeOverhead)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrTree, err)
+	}
+	return sealed, nil
+}
+
+// sealedTreeOverhead is the device key and the tag that settle.SealTree adds to a tree.
+const sealedTreeOverhead = 48
+
+// pullTree pulls the log into rep over conn and stops once rep holds entries, so a log that grows past the invite is not read.
+func (n *Node) pullTree(ctx context.Context, conn kolosync.Conn, rep *kolostore.Replica, entries uint64) {
+	pctx, cancel := context.WithTimeout(ctx, 2*n.limits.PinWait)
+	defer cancel()
+	go func() {
+		for pctx.Err() == nil && rep.Len() < entries {
+			time.Sleep(10 * time.Millisecond)
+		}
+		cancel()
+	}()
+	kolosync.PullCiphertext(pctx, conn, rep)
+}
+
+func (n *Node) pullTreeFromPins(ctx context.Context, rep *kolostore.Replica, entries uint64) {
+	for _, p := range n.cfg.Pins {
+		if rep.Len() >= entries {
+			return
+		}
+		dctx, cancel := context.WithTimeout(ctx, 2*n.limits.PinWait)
+		if conn, err := kolosecure.Dial(dctx, p.Addr, n.cfg.Device, p.ID, nil); err == nil {
+			n.pullTree(dctx, conn, rep, entries)
+			conn.Close()
+		}
+		cancel()
+	}
 }

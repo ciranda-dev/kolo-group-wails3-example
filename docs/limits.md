@@ -6,7 +6,7 @@ The room keeps only protective bounds: each one stops a hostile or broken peer f
 
 | Bound | Default | What it protects | Basis | To raise it |
 |---|---|---|---|---|
-| `MaxMessageSize` | 1 MiB | the size of one gossip envelope of a room; a larger message is refused before it is signed | kolo-gossip's own default (`Config.MaxMessageSize`). A Commit and its SettledCommit travel in one such message, so `Add` refuses one that does not fit. | set it, at most kolo-gossip's `Config.MaxMessageSize` |
+| `MaxMessageSize` | 1 MiB | the size of one gossip envelope of a room; a larger message is refused before it is signed | kolo-gossip's own default (`Config.MaxMessageSize`). Commits are not bound by it: they travel as pieces of a control log. | set it, at most kolo-gossip's `Config.MaxMessageSize` |
 | `Rate` and `Burst` | 10 messages a second, 10 at once, for each device | the work of every member, which pays a signature check, an opening and about 7 KB of gossip traffic for each message | 10 messages a second is the highest rate for a whole room that kolo-gossip's simulator measured, at 30,000 nodes; one device is held to what a whole room was measured at | set `Rate` and `Burst` |
 | `MaxParents` | 16 | the size of a message: each parent costs 32 bytes | measured: in a room of 64 devices on 127.0.0.1, with the cap off, the most parents one message named was 8 when devices sent in waves of eight and 9 when all 64 sent at once (three runs); 16 is the next power of two above. Loopback shows little concurrency; a real network may show more (UNVERIFIED). | set it |
 | `ParentHold` | 5 seconds | the time a message waits for a message it names | five history windows of kolo-gossip at its default heartbeat of one second: after that gossip no longer repairs a message that was lost on the mesh | set it |
@@ -39,13 +39,14 @@ An admin on Pebble commits every entry to disk before it goes on: an append took
 
 | Bound | Value | What it protects | Basis |
 |---|---|---|---|
-| gossip envelope reserve (`envelopeReserve`) | 256 bytes | the check that a Commit fits one message | measured: the envelope adds 178 bytes to a body (`TestEnvelopeOverhead`) |
 | welcome and SettledCommit in an invite | 1 MiB each | a join reads at most this much of either | kolo-invite's default payload bound, and one gossip message |
-| tree in an invite | `MaxTreeBytes` plus 64 bytes | a join reads at most this much | the bound above |
+| pieces of a tree an invite names | `MaxTreeBytes` divided by the piece size, plus 2 | a join pulls at most this many entries, and stops when it has them | the bound above |
+| piece of a Commit or of a tree (`maxChunk`) | 1 MiB | what a member reads for one entry of a control log or tree log | kolo-sync answers a request for entries with about 1 MiB, so a piece fits one answer; with kolo-log's padding (at most about 6 percent) it is far under kolo-sync's 4 MiB message |
+| a Commit read from the control logs | kolo-mls's `MaxCommitBytes` (128 MiB) | memory: the pieces are counted as they are read | kolo-mls's default |
 | room name | 256 bytes | the size of an invite | UNSOURCED: a display name, which the window will limit |
 | signed log header in a record | 512 bytes | the size of a record of the control log, an invite and a request to be promoted | measured: a header is 157 bytes |
 | join request and welcome of the braid | 64 KiB and 1 MiB | what a device reads from a room message about a promotion | kolo-braid's `MaxJoinRequest` and `MaxWelcome`; measured: 202 and 549 bytes |
-| a Commit or SettledCommit in a control log | `MaxMessageSize` | what a member reads for one key | the room's gossip message, which carried them before |
+| a SettledCommit in a control log | `MaxMessageSize` | what a member reads for one key | the room's gossip message |
 | epoch keys, authors, receipts and logs on disk | 32 bytes for each epoch, a certificate for each device the room had, a body for each message not stored | disk; they grow with the room's epochs and devices, since reading a segment needs them | derived |
 
 A message body can be about a ninth smaller than `MaxMessageSize`: the sealed message adds its header, parents (up to `MaxParents` times 32 bytes) and a Padme padding of at most 12 percent, and gossip refuses an envelope past the limit with `room: message too large`.
@@ -107,3 +108,17 @@ These come from `TestMeasureReaders` (`KOLO_GROUP_MEASURE=1`, one run on a lapto
 ## What the room can still lose
 
 A message is stored once a segment of an admin holds it, and its author keeps it until then (see `MaxReceipts`). It is lost only if its author loses the device before any admin stored it. A message that a device never received live is read from the segments, so a device that is behind loses nothing the admins stored. Reading a segment needs the key of its epoch: a device reads the segments of epochs before it joined only with `History`, within the room's history rule. The tests wait for the mesh before they send the first message; later losses on the mesh are repaired by republishing.
+
+## Commits by reference and the tree
+
+Neither adds a field to `room.Limits`: a Commit and a tree are cut into pieces of a fixed size, and the bounds above (`MaxTreeBytes`, kolo-mls's `MaxCommitBytes`, `PinWait`, `MaxLogs`) bound what a node reads. What each costs, measured on 127.0.0.1 with every connection real, one process, `go test -p 2`, under a load average of 5 to 10:
+
+| Run | Result |
+|---|---|
+| a Commit of a 30,000-leaf group to 64 members (`TestLargeCommitReachesSixtyFourMembers`, `KOLO_GROUP_LEAVES=30000`) | the group is built in one process in 13 s; its Commit is 2,461,142 bytes (kolo-mls measured 2,490,467 with its own credentials), 3 pieces; it reached the 63 other members, from the admin's control log through kolo-sync, in 1.04 s; the sync servers sent 160,053,963 bytes, 65.0 copies of the Commit for 63 members (the rest is the room's other traffic and framing) |
+| the same at 1,024 leaves (the default of the test) | 84,925 bytes, 1 piece, 63 members in 0.11 s, 68.8 copies |
+| 100 joiners of a 30,000-leaf group fetch the tree, no pin (`TestManyJoinersFetchALargeTreeFromThreeDevices`) | the sealed tree is 14,474,546 bytes in 14 pieces; 100 joiners pulled it from the admin and two members, 8 at a time: the last was done after 21.6 s and the median after 6.9 s; the three sent 1,491,532,346 bytes, 103.0 copies |
+| the same at 1,024 leaves, 16 joiners | 494,157 bytes in 1 piece; the last joiner 1.2 s |
+| a 3-member room, one Add | the Commit is one piece of one control log entry, pulled once by each of the 2 other members |
+
+Joiners ran 8 at a time because one process runs every device: when more than about 8 dial at once, a lookup of the swarm can wait for kolo-dht's random punch interval (20 seconds) before it connects, so `Join` looks the topic up again each second while it has no connection. These rows therefore measure the room code and kolo-sync, not a network. Not measured: the pins serving the tree to many joiners (the pins' own limits apply), joiners from different networks, and the load that replicating the tree puts on members: every member whose epoch has not passed an Add's epoch pulls that Add's tree log once (14.5 MB at 30,000 leaves), so a room that adds members often pays that for each Add. The choice of fewer serving devices needs a measurement of its own and is not built.

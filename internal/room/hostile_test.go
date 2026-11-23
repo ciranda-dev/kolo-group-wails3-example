@@ -8,6 +8,7 @@ import (
 	"time"
 
 	kologossip "github.com/ciranda-dev/kolo-gossip"
+	koloid "github.com/ciranda-dev/kolo-id"
 	kolosync "github.com/ciranda-dev/kolo-sync"
 
 	"github.com/ciranda-dev/kolo-mls/settle"
@@ -171,10 +172,8 @@ func TestFloodIsBoundedByTheRate(t *testing.T) {
 func TestCommitMessagesAreChecked(t *testing.T) {
 	h := newHostile(t, Limits{})
 	v := h.r.view.Load()
-	settled := func(gid []byte, epoch uint64) []byte {
-		return (&settle.Settled{TBS: settle.TBS{GroupID: gid, Epoch: epoch}}).Encode()
-	}
-	body := func(s []byte) []byte { return (&commitMsg{Settled: s, Commit: []byte{1}}).encode() }
+	settled := func(gid []byte, epoch uint64) []byte { return settledBy(h.a.dev, gid, epoch) }
+	body := func(s []byte) []byte { return (&commitRef{Settled: s}).encode() }
 	m := func(dev []byte, s []byte) *kologossip.Message {
 		return &kologossip.Message{Device: dev, Person: h.person, Time: time.Now(), Body: body(s)}
 	}
@@ -194,6 +193,26 @@ func TestCommitMessagesAreChecked(t *testing.T) {
 	if err := h.r.check(m(h.deviceA, []byte("not a settled commit"))); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("a Commit that does not decode: %v", err)
 	}
+	// An announcement a settler did not sign is refused though an admin sends it.
+	if err := h.r.check(m(h.deviceA, settledBy(h.b.dev, gid, v.epoch))); !errors.Is(err, ErrCommitRef) {
+		t.Fatalf("an announcement signed by a device that is no settler: %v", err)
+	}
+	if err := h.r.check(m(h.deviceA, (&settle.Settled{TBS: settle.TBS{GroupID: gid, Epoch: v.epoch}}).Encode())); !errors.Is(err, ErrCommitRef) {
+		t.Fatalf("an announcement with no signature: %v", err)
+	}
+	if got := h.r.validate(context.Background(), m(h.deviceB, settled(gid, v.epoch))); got != kologossip.Reject {
+		t.Fatalf("verdict for a forged announcement: %v", got)
+	}
+}
+
+// settledBy is a SettledCommit of epoch with one signature, by signer.
+func settledBy(signer *koloid.Identity, gid []byte, epoch uint64) []byte {
+	t := settle.TBS{GroupID: gid, Epoch: epoch, Commit: [32]byte{1}}
+	sig, err := signer.Sign(settle.SettledContext, t.Encode())
+	if err != nil {
+		panic(err)
+	}
+	return (&settle.Settled{TBS: t, Shares: []settle.Share{{Signer: [32]byte(signer.PublicKey()), Signature: [64]byte(sig)}}}).Encode()
 }
 
 // Messages sent at once from every member reach every member, each device's in its own order, and a reply shows
@@ -276,7 +295,7 @@ func TestSyncAndGossipShareOneConnection(t *testing.T) {
 	waitFor(t, 10*time.Second, "the message", func() bool { return gr.recs[1].has("still gossiping") })
 }
 
-// TestEnvelopeOverhead measures what gossip's envelope adds to a body, so envelopeReserve is a bound and no guess.
+// TestEnvelopeOverhead measures what gossip's envelope adds to a body.
 func TestEnvelopeOverhead(t *testing.T) {
 	const limit = 4096
 	gr := newGroup(t, 2, Limits{MaxMessageSize: limit})
@@ -297,8 +316,8 @@ func TestEnvelopeOverhead(t *testing.T) {
 	}
 	overhead := limit - lo
 	t.Logf("gossip's envelope adds %d bytes to a body", overhead)
-	if overhead <= 0 || overhead > envelopeReserve {
-		t.Fatalf("overhead %d against a reserve of %d", overhead, envelopeReserve)
+	if overhead <= 0 {
+		t.Fatalf("overhead %d", overhead)
 	}
 }
 
@@ -309,7 +328,7 @@ func FuzzCheck(f *testing.F) {
 	v := r.view.Load()
 	good := forged(r, &v.key, v.epoch, a.person.PublicKey(), a.dev, 1, &content{Time: time.Now().UnixMilli(), Body: []byte("x")}).Body
 	f.Add(good)
-	f.Add((&commitMsg{Settled: (&settle.Settled{TBS: settle.TBS{GroupID: r.gid[:], Epoch: v.epoch}}).Encode(), Commit: []byte{1}}).encode())
+	f.Add((&commitRef{Settled: settledBy(a.dev, r.gid[:], v.epoch)}).encode())
 	f.Add([]byte{kindCommit, 0xff, 0xff})
 	f.Add([]byte{kindLeave})
 	f.Add([]byte{kindLeave, 1})

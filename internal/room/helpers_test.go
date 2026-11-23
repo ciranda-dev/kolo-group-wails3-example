@@ -450,12 +450,19 @@ func (gr *group) joinBatch(ctx context.Context, nds []*tnode) {
 	if err != nil {
 		gr.t.Fatal(err)
 	}
-	for _, nd := range nds {
-		r, err := nd.n.Join(ctx, w)
-		if err != nil {
-			gr.t.Fatal(err)
+	// Each join pulls its tree from the devices a lookup finds, so they run together.
+	joined := make([]*Room, len(nds))
+	errs := make([]error, len(nds))
+	var wg sync.WaitGroup
+	for i, nd := range nds {
+		wg.Go(func() { joined[i], errs[i] = nd.n.Join(ctx, w) })
+	}
+	wg.Wait()
+	for i, nd := range nds {
+		if errs[i] != nil {
+			gr.t.Fatal(errs[i])
 		}
-		gr.nodes, gr.rooms, gr.recs = append(gr.nodes, nd), append(gr.rooms, r), append(gr.recs, recordWith(r, gr.light))
+		gr.nodes, gr.rooms, gr.recs = append(gr.nodes, nd), append(gr.rooms, joined[i]), append(gr.recs, recordWith(joined[i], gr.light))
 	}
 	gr.waitEpoch(gr.rooms[0].Status().Epoch)
 }
