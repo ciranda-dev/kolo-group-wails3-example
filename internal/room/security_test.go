@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	kologossip "github.com/ciranda-dev/kolo-gossip"
 	"github.com/ciranda-dev/kolo-mls/settle"
 	kolostore "github.com/ciranda-dev/kolo-store"
 )
@@ -414,4 +415,41 @@ func TestContactReportDoesNotHoldTheRoomLock(t *testing.T) {
 		r.mu.Unlock()
 		return true
 	})
+}
+
+// A device over its rate is refused before its signatures are checked.
+func TestRateIsCheckedBeforeTheSignatures(t *testing.T) {
+	gr := newGroup(t, 2, Limits{Rate: 1, Burst: 2})
+	gr.waitMesh(1)
+	admin, member := gr.rooms[0], gr.rooms[1]
+	e := admin.Status().Epoch
+	exhaust := func(r *Room, mk func() *kologossip.Message) {
+		t.Helper()
+		for i := 0; ; i++ {
+			err := r.check(mk())
+			if errors.Is(err, ErrRate) {
+				return
+			}
+			if err != nil || i > 10 {
+				t.Fatalf("message %d: %v", i, err)
+			}
+		}
+	}
+	exhaust(admin, func() *kologossip.Message { return sealAs(t, admin, gr.nodes[1], e, member.seq.Add(1), "x") })
+	bad := sealAs(t, admin, gr.nodes[1], e, member.seq.Add(1), "bad signature")
+	bad.Body[len(bad.Body)-1] ^= 1
+	if err := admin.check(bad); !errors.Is(err, ErrRate) {
+		t.Fatalf("a message with a bad signature over the rate: %v", err)
+	}
+	offer := func() *kologossip.Message {
+		return &kologossip.Message{Person: gr.nodes[0].person.PublicKey(), Device: gr.nodes[0].key(), Seq: admin.seq.Add(1), Time: time.Now(),
+			Body: (&adminOffer{Kind: kindPromote, Device: [32]byte(gr.nodes[1].key())}).encode()}
+	}
+	exhaust(member, offer)
+	forged := &settle.Settled{TBS: settle.TBS{GroupID: admin.gid[:], Epoch: e}}
+	ref := offer()
+	ref.Body = (&commitRef{Settled: forged.Encode()}).encode()
+	if err := member.check(ref); !errors.Is(err, ErrRate) {
+		t.Fatalf("an unsigned announcement over the rate: %v", err)
+	}
 }
