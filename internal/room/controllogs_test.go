@@ -113,6 +113,87 @@ func TestHistoryOfMoreEpochsThanMaxLogs(t *testing.T) {
 	}
 }
 
+// A ctlPrev record an admin appends anywhere but at the start of a log, or with an epoch past what the log may name, is
+// refused, so History does not wait for the log it names.
+func TestForgedPrevRecordDoesNotStallHistory(t *testing.T) {
+	gr := newGroup(t, 2, Limits{CatchUpWait: 3 * time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	sent := gr.advance(t, ctx, 4, "old")
+	gr.join(ctx, gr.newNode())
+	admin, j := gr.rooms[0], gr.rooms[2]
+	fake, err := admin.openLog(true, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fake.close()
+	if err := admin.appendCtl(&ctlRecord{Kind: ctlPrev, Epoch: admin.Status().Epoch, Header: fake.header}, &ctlRecord{Kind: ctlPrev, Epoch: 1 << 62, Header: fake.header}); err != nil {
+		t.Fatal(err)
+	}
+	admin.logMu.Lock()
+	ctl, n := admin.ctl.key(), admin.ctl.log.Len()
+	admin.logMu.Unlock()
+	waitFor(t, 30*time.Second, "the joiner reads the forged record", func() bool {
+		j.logMu.Lock()
+		defer j.logMu.Unlock()
+		l := j.logs[ctl]
+		return l != nil && l.applied >= n
+	})
+	start := time.Now()
+	got := bodiesOf(t, readHistory(t, ctx, j, 100))
+	if d := time.Since(start); d >= 3*time.Second {
+		t.Fatalf("History took %v with a forged ctlPrev (CatchUpWait 3s)", d.Round(time.Millisecond))
+	}
+	for body, e := range sent {
+		if got[body] != e {
+			t.Errorf("history lacks %s of epoch %d", body, e)
+		}
+	}
+	waitFor(t, 10*time.Second, "the reports of the forged records", func() bool {
+		return hasErr(gr.recs[2], ErrMalformed) && hasErr(gr.recs[2], ErrWrongEpoch)
+	})
+}
+
+// A control log that no peer serves is waited for once, CatchUpWait, and then History goes on without it.
+func TestUnservedPrevLogIsWaitedForOnce(t *testing.T) {
+	gr := newGroup(t, 2, Limits{CatchUpWait: 2 * time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	sent := gr.advance(t, ctx, 4, "old")
+	gr.join(ctx, gr.newNode())
+	admin, j := gr.rooms[0], gr.rooms[2]
+	fake, err := admin.openLog(true, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fake.close()
+	j.hmu.Lock()
+	j.prevs = append(j.prevs, prevLog{epoch: j.joinEpoch, owner: [32]byte(admin.self), header: fake.header})
+	j.hmu.Unlock()
+	start := time.Now()
+	evs := readHistory(t, ctx, j, 100)
+	d := time.Since(start)
+	got, reports := map[string]uint64{}, 0
+	for _, ev := range evs {
+		if ev.Err != nil {
+			reports++
+			continue
+		}
+		got[string(ev.Body)] = ev.Epoch
+	}
+	if d >= 4*time.Second {
+		t.Fatalf("History of 4 epochs took %v with one control log no peer serves (CatchUpWait 2s)", d.Round(time.Millisecond))
+	}
+	for body, e := range sent {
+		if got[body] != e {
+			t.Errorf("history lacks %s of epoch %d", body, e)
+		}
+	}
+	if reports != 1 {
+		t.Errorf("%d reports, want 1 for the control log no peer serves", reports)
+	}
+}
+
 // replicaHeader returns the header of a new log of the device of nd, kept in a store of its own.
 func replicaHeader(t *testing.T, nd *tnode, r *Room) []byte {
 	t.Helper()
@@ -172,5 +253,48 @@ func TestPrevsDoNotGrowWithEpochs(t *testing.T) {
 	m.hmu.Unlock()
 	if n > 1 {
 		t.Fatalf("the member keeps %d records of earlier control logs after 8 epochs", n)
+	}
+}
+
+// A ctlOpen that names an epoch past what its control log may name is refused and reported, and the device does not wait
+// for the segment.
+func TestFarEpochSegmentIsRefused(t *testing.T) {
+	gr := newGroup(t, 2, Limits{CatchUpWait: 2 * time.Second, PinWait: 500 * time.Millisecond})
+	gr.waitMesh(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	admin, m := gr.rooms[0], gr.rooms[1]
+	if _, err := admin.Send(ctx, []byte("first"), MessageID{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 20*time.Second, "first", func() bool { return gr.recs[1].has("first") })
+	far := uint64(1) << 40
+	l, err := admin.openLog(false, far, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin.logMu.Lock()
+	err = admin.trackLocked(l)
+	admin.logMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := &sealed{Epoch: admin.Status().Epoch + 1, CT: []byte{1, 2, 3}}
+	if _, err := l.log.Append((&stored{Device: [32]byte(admin.self), Seq: 1, Body: bad.encode()}).encode()); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.appendCtl(&ctlRecord{Kind: ctlOpen, Epoch: far, Header: l.header}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Send(ctx, []byte("after"), MessageID{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 20*time.Second, "after", func() bool { return gr.recs[1].has("after") })
+	time.Sleep(time.Second)
+	m.logMu.Lock()
+	followed := m.logs[l.key()] != nil
+	m.logMu.Unlock()
+	if followed || !hasErr(gr.recs[1], ErrWrongEpoch) || m.Status().CatchingUp {
+		t.Fatalf("a segment of epoch 2^40: followed %v, reported %v, catching up %v", followed, hasErr(gr.recs[1], ErrWrongEpoch), m.Status().CatchingUp)
 	}
 }

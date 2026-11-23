@@ -65,6 +65,8 @@ type roomLog struct {
 	openedTo    uint64 // the newest epoch it opened one for
 	done        bool   // a control log that its admin went on from in another log
 	past        bool   // a control log that History asked for
+	top         uint64 // the newest epoch a control log may be of, from the record that named it
+	waited      bool   // a control log whose first record History stopped waiting for
 }
 
 func (l *roomLog) key() logKey { return keyOf(l.owner, l.id) }
@@ -373,11 +375,15 @@ func (r *Room) replicateKind(owner [32]byte, header []byte, ctl, tree bool, epoc
 	return r.replicateAs(&roomLog{owner: owner, header: header, ctl: ctl, tree: tree, epoch: epoch})
 }
 
-// replicateAs opens the replica of the log that l describes. Only replicas count against MaxLogs.
+// replicateAs opens the replica of the log that l describes. A control log that History did not ask for may be of the
+// epoch that named it or, when none did, of at most the epoch after this device's. Only replicas count against MaxLogs.
 func (r *Room) replicateAs(l *roomLog) (*roomLog, error) {
 	hd, err := kololog.DecodeLogHeader(l.header)
 	if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) {
 		return nil, fmt.Errorf("%w: log header", ErrMalformed)
+	}
+	if l.ctl && !l.past {
+		l.top = max(l.epoch, r.view.Load().epoch+1)
 	}
 	r.logMu.Lock()
 	defer r.logMu.Unlock()

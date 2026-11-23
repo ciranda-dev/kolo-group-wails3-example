@@ -188,9 +188,9 @@ func (r *Room) notePrev(l *roomLog, rec *ctlRecord) {
 	}
 }
 
-// followPrev follows a control log that History needs.
+// followPrev follows a control log that History needs; it is of an epoch before the one of the log that named it.
 func (r *Room) followPrev(p prevLog) {
-	if _, err := r.replicateAs(&roomLog{owner: p.owner, header: p.header, ctl: true, past: true}); err != nil && r.ctx.Err() == nil {
+	if _, err := r.replicateAs(&roomLog{owner: p.owner, header: p.header, ctl: true, past: true, top: p.epoch - 1}); err != nil && r.ctx.Err() == nil {
 		r.emit(Event{Kind: CatchingUp, Err: fmt.Errorf("%w: %w", ErrCatchUp, err)})
 	}
 }
@@ -205,7 +205,7 @@ func (r *Room) pastRead(e uint64) bool {
 	r.logMu.Lock()
 	defer r.logMu.Unlock()
 	for _, l := range r.logs {
-		if l.ctl && !l.own && l.applied == 0 {
+		if l.ctl && !l.own && l.applied == 0 && !l.waited {
 			return false
 		}
 	}
@@ -218,6 +218,45 @@ func (r *Room) pastRead(e uint64) bool {
 		}
 	}
 	return true
+}
+
+// giveUp stops waiting for what pastRead(e) still lacks after CatchUpWait: the first record of a control log, and a log
+// before one that no peer serves to its end, with the logs it named. Each log given up is reported in the next page.
+func (r *Room) giveUp(e uint64) {
+	r.hmu.Lock()
+	prevs := slices.Clone(r.prevs)
+	r.hmu.Unlock()
+	var drop []logKey
+	r.logMu.Lock()
+	for _, l := range r.logs {
+		if l.ctl && !l.own && l.applied == 0 {
+			l.waited = true
+		}
+	}
+	for _, p := range prevs {
+		k := p.key()
+		if l := r.logs[k]; p.epoch <= e || l != nil && l.done && l.applied >= l.view.Len() {
+			continue
+		}
+		drop = append(drop, k)
+		if l := r.logs[k]; l != nil && l.past {
+			r.forgetLocked(l, true)
+		}
+		r.hreports = append(r.hreports, Event{Kind: Message, Epoch: p.epoch - 1, ID: MessageID(sha256Of(k[:])),
+			Err: fmt.Errorf("%w: no peer serves the control log of device %x before epoch %d", ErrCatchUp, p.owner[:4], p.epoch)})
+	}
+	r.logMu.Unlock()
+	r.hmu.Lock()
+	defer r.hmu.Unlock()
+	for n := -1; n != len(r.prevs); {
+		n = len(r.prevs)
+		r.prevs = slices.DeleteFunc(r.prevs, func(p prevLog) bool {
+			if slices.Contains(drop, p.from) && !slices.Contains(drop, p.key()) {
+				drop = append(drop, p.key())
+			}
+			return slices.Contains(drop, p.key())
+		})
+	}
 }
 
 // pastOpen remembers a segment of an epoch before the join that the policy lets this device read.
@@ -431,7 +470,9 @@ func (r *Room) loadEpoch(ctx context.Context, e uint64) ([]Event, error) {
 			r.followPrev(p)
 		}
 	}
-	r.waitUntil(ctx, func() bool { return r.pastRead(e) })
+	if !r.waitUntil(ctx, func() bool { return r.pastRead(e) }) && ctx.Err() == nil {
+		r.giveUp(e)
+	}
 	if err := r.deriveBack(ctx, e); err != nil {
 		return nil, err
 	}

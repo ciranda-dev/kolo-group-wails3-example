@@ -175,9 +175,21 @@ func (r *Room) reportOnce(l *roomLog, err error) {
 	}
 }
 
-// applyCtl applies entry i of the control log l of an admin; it reports whether a log was added.
+// applyCtl applies entry i of the control log l of an admin; it reports whether a log was added. An admin writes to its
+// control log of an epoch only while the room is in it, so a record that names an epoch past the next one, or that is
+// out of its place in the chain of the admin's logs, is reported and passed over.
 func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 	v := r.view.Load()
+	switch rec.Kind {
+	case ctlOpen, ctlTree, ctlLink, ctlRead, ctlNext, ctlPrev:
+		r.logMu.Lock()
+		reach := max(l.epoch, l.top) + 1
+		r.logMu.Unlock()
+		if rec.Epoch > reach {
+			r.refuse(l, i, fmt.Errorf("%w: it names epoch %d, past %d", ErrWrongEpoch, rec.Epoch, reach))
+			return false
+		}
+	}
 	switch rec.Kind {
 	case ctlPut, ctlChunk:
 		if r.indexRecord(l, i, rec) {
@@ -218,10 +230,16 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 			return false
 		}
 		r.logMu.Lock()
-		l.done = true
-		past := l.past
-		r.persistLogLocked(l)
+		back, past := rec.Epoch <= l.epoch, l.past
+		if !back {
+			l.done = true
+			r.persistLogLocked(l)
+		}
 		r.logMu.Unlock()
+		if back {
+			r.refuse(l, i, fmt.Errorf("%w: the next log is of epoch %d, not after %d", ErrWrongEpoch, rec.Epoch, l.epoch))
+			return false
+		}
 		// The log after one that History asked for is followed already, or was.
 		return !past && r.addLog(l.owner, rec.Header, true, rec.Epoch)
 	case ctlPrev:
@@ -229,10 +247,18 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 		if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) || !v.roles.Admin(l.owner[:]) {
 			return false
 		}
+		// Only the first record of a log names the log before it, with the epoch of its own log.
 		r.logMu.Lock()
-		l.epoch = max(l.epoch, rec.Epoch)
-		r.persistLogLocked(l)
+		ok := i == 0 && (l.epoch == 0 && rec.Epoch <= l.top || l.epoch != 0 && rec.Epoch == l.epoch)
+		if ok && l.epoch == 0 {
+			l.epoch = rec.Epoch
+			r.persistLogLocked(l)
+		}
 		r.logMu.Unlock()
+		if !ok {
+			r.refuse(l, i, fmt.Errorf("%w: a record that names the log before, of epoch %d, out of its place", ErrMalformed, rec.Epoch))
+			return false
+		}
 		r.notePrev(l, rec)
 	case ctlDir:
 		hd, err := kololog.DecodeLogHeader(rec.Header)
@@ -251,6 +277,13 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 		return r.addLog([32]byte(hd.LogKey), rec.Header, true, 0)
 	}
 	return false
+}
+
+// refuse reports a record of a control log that applyCtl passes over.
+func (r *Room) refuse(l *roomLog, i uint64, cause error) {
+	if r.ctx.Err() == nil {
+		r.emit(Event{Kind: CatchingUp, Err: fmt.Errorf("%w: entry %d of a control log of device %x: %w", ErrCatchUp, i, l.owner[:4], cause)})
+	}
 }
 
 // retryDirs follows the control logs that admins named before the roles named their owners.
