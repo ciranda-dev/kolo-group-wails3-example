@@ -201,8 +201,9 @@ type Room struct {
 	links    map[uint64][]linkRec // the history links of each epoch before the join, one for each admin
 	past     map[uint64][]*pastSeg
 	pastBy   map[logKey]*pastSeg
-	prevs    []prevLog   // the control logs that came before the ones followed
-	wantPast atomic.Bool // History has asked for the epochs before the join
+	prevs    []prevLog         // the control logs that came before the ones followed
+	early    map[logKey]uint64 // the final sizes of segments closed before a log that opened them was read
+	wantPast atomic.Bool       // History has asked for the epochs before the join
 
 	histMu   sync.Mutex // serializes History and guards what follows
 	hbound   uint64     // the epochs from it up are loaded
@@ -268,7 +269,7 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 		adminKick: make(chan struct{}, 1), syncKick: make(chan struct{}, 1), pushKick: make(chan struct{}, 1),
 		kv: kv, logSec: sec, logs: map[logKey]*roomLog{}, dirs: map[[32]byte][]byte{}, rcpt: map[MessageID]*receipt{}, welcomed: map[[32]byte]uint64{},
 		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, leaving: map[[32]byte]struct{}{}, badCommits: map[[32]byte]struct{}{}, settledIn: map[uint64]*seenCommit{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, first: map[[32]byte]uint64{}, joinEpoch: v.epoch,
-		links: map[uint64][]linkRec{}, past: map[uint64][]*pastSeg{}, pastBy: map[logKey]*pastSeg{}}
+		links: map[uint64][]linkRec{}, past: map[uint64][]*pastSeg{}, pastBy: map[logKey]*pastSeg{}, early: map[logKey]uint64{}}
 	if readKey != nil {
 		r.reader, r.readKey = true, *readKey
 	}

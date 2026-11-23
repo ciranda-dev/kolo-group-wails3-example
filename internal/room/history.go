@@ -189,13 +189,20 @@ func (r *Room) followPrev(p prevLog) {
 	r.logMu.Unlock()
 }
 
-// pastRead reports whether every control log that History needs for epoch e has been followed and read to its end.
+// pastRead reports whether every control log that History needs for epoch e has been followed and read to its end: each
+// followed control log has its first record read, which names the log before it, and each log before one of an epoch
+// after e is followed and read to its last record.
 func (r *Room) pastRead(e uint64) bool {
 	r.hmu.Lock()
 	prevs := slices.Clone(r.prevs)
 	r.hmu.Unlock()
 	r.logMu.Lock()
 	defer r.logMu.Unlock()
+	for _, l := range r.logs {
+		if l.ctl && !l.own && l.applied == 0 {
+			return false
+		}
+	}
 	for _, p := range prevs {
 		if p.epoch <= e || p.epoch <= r.joinHist().floor(r.joinEpoch) {
 			continue
@@ -226,17 +233,26 @@ func (r *Room) pastOpen(l *roomLog, i uint64, rec *ctlRecord) {
 	defer r.hmu.Unlock()
 	k := keyOf(l.owner, hd.LogID)
 	if r.pastBy[k] == nil {
+		if size, ok := r.early[k]; ok {
+			s.closed, s.size = true, size
+			delete(r.early, k)
+		}
 		r.pastBy[k] = s
 		r.past[rec.Epoch] = append(r.past[rec.Epoch], s)
 	}
 }
 
-// pastClose records the final size of a segment that pastOpen knows.
+// pastClose records the final size of a segment that pastOpen knows. The close of the last segment of an epoch is in the
+// admin's control log of the next epoch, which a joiner reads before the log that opened the segment, so a close of a
+// segment not known yet is kept for it, up to MaxLogs of them.
 func (r *Room) pastClose(l *roomLog, rec *ctlRecord) {
 	r.hmu.Lock()
 	defer r.hmu.Unlock()
-	if s := r.pastBy[keyOf(l.owner, rec.ID)]; s != nil {
+	k := keyOf(l.owner, rec.ID)
+	if s := r.pastBy[k]; s != nil {
 		s.closed, s.size = true, rec.Size
+	} else if len(r.early) < r.n.limits.MaxLogs {
+		r.early[k] = rec.Size
 	}
 }
 
