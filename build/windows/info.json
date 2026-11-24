@@ -1,0 +1,15 @@
+{
+	"fixed": {
+		"file_version": "0.0.0"
+	},
+	"info": {
+		"0409": {
+			"ProductVersion": "0.0.0",
+			"CompanyName": "Ciranda",
+			"FileDescription": "Desktop group chat built with Kolo",
+			"LegalCopyright": "(c) 2026, Ciranda",
+			"ProductName": "Kolo Group",
+			"Comments": "Kolo Group, a desktop group chat"
+		}
+	}
+}
