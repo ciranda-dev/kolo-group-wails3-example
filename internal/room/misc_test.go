@@ -65,16 +65,23 @@ func TestOperationsRefuseWhatTheyCannotDo(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 20*time.Second, "the message", func() bool { return gr.recs[2].has("still works") })
-	if _, err := gr.nodes[0].n.Create(ctx, "x", Policy{ReadLink: true}); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("Create with a policy that is not built: %v", err)
+	if _, err := gr.nodes[0].n.Create(ctx, "x", Policy{ReadLink: true}); !errors.Is(err, ErrInvalid) {
+		t.Errorf("Create with a read link and no posters: %v", err)
 	}
 	if _, err := gr.nodes[0].n.Create(ctx, string(make([]byte, maxName+1)), Policy{}); !errors.Is(err, ErrInvalid) {
 		t.Errorf("Create with a long name: %v", err)
 	}
-	for _, err := range []error{a.Promote(ctx, gr.nodes[1].key(), Settler), a.SetPolicy(ctx, Policy{}), a.Leave(ctx)} {
-		if !errors.Is(err, ErrNotImplemented) {
-			t.Errorf("an unbuilt method: %v", err)
-		}
+	if err := a.Promote(ctx, gr.nodes[1].key(), Settler); !errors.Is(err, ErrNotImplemented) {
+		t.Errorf("Promote to Settler: %v", err)
+	}
+	if err := a.Leave(ctx); !errors.Is(err, ErrInvalid) {
+		t.Errorf("Leave of an admin: %v", err)
+	}
+	if err := b.SetPolicy(ctx, Policy{}); err != nil {
+		t.Errorf("SetPolicy to the policy the room has: %v", err)
+	}
+	if err := b.SetPolicy(ctx, Policy{AdminsPost: true}); !errors.Is(err, ErrNotAdmin) {
+		t.Errorf("SetPolicy by a member that is no admin: %v", err)
 	}
 	if err := a.Promote(ctx, nil, Admin); !errors.Is(err, ErrInvalid) {
 		t.Errorf("Promote of no device: %v", err)
@@ -88,11 +95,11 @@ func TestOperationsRefuseWhatTheyCannotDo(t *testing.T) {
 	if err := a.Promote(ctx, gr.nodes[0].key(), Admin); err != nil {
 		t.Errorf("Promote of an admin: %v", err)
 	}
-	if _, err := a.Link(); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("Link: %v", err)
+	if _, err := a.Link(); !errors.Is(err, ErrNoLink) {
+		t.Errorf("Link of a room with none: %v", err)
 	}
-	if _, err := gr.nodes[0].n.JoinLink(ctx, nil); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("JoinLink: %v", err)
+	if _, err := gr.nodes[0].n.JoinLink(ctx, nil); !errors.Is(err, ErrMalformed) {
+		t.Errorf("JoinLink of nothing: %v", err)
 	}
 }
 

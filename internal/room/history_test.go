@@ -186,7 +186,7 @@ func TestSinceEpochReadsOnlyFromThePoint(t *testing.T) {
 	sent := gr.advance(t, ctx, 10, "s")
 	gr.join(ctx, gr.newNode())
 	r := gr.rooms[len(gr.rooms)-1]
-	if p := r.view.Load().hist; p != (histPolicy{Rule: SinceEpoch, Since: since}) {
+	if p := r.view.Load().pol.hist; p != (histPolicy{Rule: SinceEpoch, Since: since}) {
 		t.Fatalf("the joiner reads the policy %+v", p)
 	}
 	got := bodiesOf(t, readHistory(t, ctx, r, 4))
@@ -280,7 +280,8 @@ func TestMemberRemovedAtEpoch20ReadsNothingAfter(t *testing.T) {
 	}
 }
 
-// A link written after a segment of its epoch or a later one, or for an epoch the policy leaves out, is refused and reported.
+// A link written after a segment of its epoch or a later one is refused and reported; one for an epoch before the join that
+// the policy leaves out is of no use and is dropped, since the policy of its own epoch may have allowed it.
 func TestLateAndOutOfPolicyLinksAreRefused(t *testing.T) {
 	gr := newHistoryGroup(t, 2, Policy{History: SinceEpoch, Since: 1})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -318,8 +319,8 @@ func TestLateAndOutOfPolicyLinksAreRefused(t *testing.T) {
 		{"after a segment of an older epoch", &roomLog{owner: owner, ctl: true, opened: true, openedTo: 4}, 6, true, 0},
 		{"after a segment of its epoch", &roomLog{owner: owner, ctl: true, opened: true, openedTo: 7}, 7, false, 1},
 		{"after a segment of a later epoch", &roomLog{owner: owner, ctl: true, opened: true, openedTo: 9}, 8, false, 2},
-		{"for an epoch the policy leaves out", &roomLog{owner: owner, ctl: true}, 1, false, 3},
-		{"for an epoch past the join", &roomLog{owner: owner, ctl: true}, 11, false, 3},
+		{"for an epoch before the join that the policy leaves out", &roomLog{owner: owner, ctl: true}, 1, false, 2},
+		{"for an epoch past the join", &roomLog{owner: owner, ctl: true}, 11, false, 2},
 	} {
 		r.addLink(c.l, &ctlRecord{Kind: ctlLink, Epoch: c.epoch, Value: good})
 		waitFor(t, 5*time.Second, c.name, func() bool { return reports() == c.reports })

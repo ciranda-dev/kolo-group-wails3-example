@@ -65,10 +65,11 @@ func (k roomKV) each(kind string, fn func(tail, v []byte) error) error {
 	return err
 }
 
-// The record kinds of a room: its meta, epoch keys, logs, authors, receipts and local pins.
+// The record kinds of a room: its meta, epoch keys, policies, logs, authors, receipts and local pins.
 const (
 	recMeta    = "m"
 	recKey     = "k/"
+	recPolicy  = "p/"
 	recLog     = "l/"
 	recAuthor  = "a/"
 	recReceipt = "x/"

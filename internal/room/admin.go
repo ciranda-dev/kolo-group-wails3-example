@@ -95,7 +95,7 @@ func (r *Room) commit(ctx context.Context, o kolomls.CommitOptions) (welcome, se
 	r.stepErr = nil
 	epoch = r.m.Epoch()
 	var hash [32]byte
-	if o.SetExtensions {
+	if o.SetExtensions && r.rolesChange(o.Extensions) {
 		// A roles change is small, and the admin checks it against the braid before it commits.
 		if welcome, err = r.admin.Commit(ctx, o); err != nil {
 			r.mu.Unlock()
@@ -149,6 +149,13 @@ func (r *Room) commit(ctx context.Context, o kolomls.CommitOptions) (welcome, se
 	return welcome, settled, epoch, nil
 }
 
+// rolesChange reports whether extensions change the room's roles, which the admin checks against the braid; a change of the
+// policy alone is committed like any other Commit, and checked for its size.
+func (r *Room) rolesChange(exts []kolomls.Extension) bool {
+	next, err := settle.RolesOf(exts, r.m.Limits())
+	return err != nil || !bytes.Equal(next.Encode(), r.view.Load().roles.Encode())
+}
+
 // settledBound is kolo-mls's bound on a SettledCommit of n settlers.
 func settledBound(n int) int { return 512 + 96*n }
 
@@ -193,6 +200,9 @@ func (r *Room) controlHeaders() [][]byte {
 // Remove removes every device of a person from the room. Only an admin device removes, and the person must have no
 // admin device.
 func (r *Room) Remove(ctx context.Context, person ed25519.PublicKey) error {
+	if r.reader {
+		return ErrNotAdmin
+	}
 	r.mu.Lock()
 	var leaves []uint32
 	t := r.m.Tree()

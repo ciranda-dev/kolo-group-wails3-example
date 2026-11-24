@@ -16,6 +16,7 @@ const (
 	kindPromote      byte = 3
 	kindAdminRequest byte = 4
 	kindAdminWelcome byte = 5
+	kindLeave        byte = 6 // a member asks the admins to remove its person
 )
 
 const idSize = 32
@@ -267,14 +268,15 @@ const (
 	ctlClose byte = 3 // a segment closed, with its final size
 	ctlDir   byte = 4 // the control log of another admin
 	ctlLink  byte = 5 // the history link of an epoch
+	ctlRead  byte = 6 // the state of an epoch sealed under the room's read secret, for the readers of a read link
 )
 
 // ctlRecord is one entry of an admin's control log.
 type ctlRecord struct {
 	Kind   byte
 	Key    string // ctlPut
-	Value  []byte // ctlPut, ctlLink
-	Epoch  uint64 // ctlOpen, ctlLink
+	Value  []byte // ctlPut, ctlLink, ctlRead
+	Epoch  uint64 // ctlOpen, ctlLink, ctlRead
 	Header []byte // ctlOpen, ctlDir: the signed log header, so a reader opens the replica without asking anyone
 	ID     [32]byte
 	Size   uint64 // ctlClose
@@ -298,6 +300,9 @@ func (c *ctlRecord) encode() []byte {
 	case ctlLink:
 		e.PutUvarint(c.Epoch)
 		e.PutFixed(c.Value)
+	case ctlRead:
+		e.PutUvarint(c.Epoch)
+		e.PutBytes(c.Value)
 	}
 	return e.Bytes()
 }
@@ -330,6 +335,10 @@ func decodeCtl(b []byte, maxValue int) (*ctlRecord, error) {
 	case ctlLink:
 		if c.Epoch, err = d.Uvarint(); err == nil {
 			c.Value, err = d.Fixed(linkSize)
+		}
+	case ctlRead:
+		if c.Epoch, err = d.Uvarint(); err == nil {
+			c.Value, err = d.Bytes(maxValue)
 		}
 	default:
 		err = errors.New("unknown kind")

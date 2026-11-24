@@ -197,6 +197,8 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 		return r.addLog(l.owner, rec.Header, false, rec.Epoch)
 	case ctlLink:
 		r.addLink(l, rec)
+	case ctlRead:
+		r.addRead(rec)
 	case ctlClose:
 		r.pastClose(l, rec)
 		r.logMu.Lock()
@@ -276,6 +278,9 @@ func (r *Room) advance() {
 }
 
 func (r *Room) advanceOnce() bool {
+	if r.reader {
+		return false
+	}
 	r.mu.Lock()
 	if r.m.Removed() {
 		r.mu.Unlock()

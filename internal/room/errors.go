@@ -13,6 +13,8 @@ var (
 	ErrRemoved         = errors.New("room: removed from the room")
 	ErrNotAdmin        = errors.New("room: not an admin device")
 	ErrNotMember       = errors.New("room: not a member device")
+	ErrNotPoster       = errors.New("room: this device may not post in this room")
+	ErrNoLink          = errors.New("room: the room has no read link")
 	ErrUnknownRoom     = errors.New("room: unknown room")
 	ErrMalformed       = errors.New("room: malformed message")
 	ErrWrongEpoch      = errors.New("room: message of another epoch")

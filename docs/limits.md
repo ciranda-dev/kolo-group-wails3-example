@@ -13,7 +13,7 @@ The room keeps only protective bounds: each one stops a hostile or broken peer f
 | `MaxHeld` | 8,333 | memory: messages that wait for a parent; past it the oldest shows at once | kolo-gossip's `MaxCacheMessages`, the messages it keeps per topic | set it |
 | `MaxKnown` | 200,000 | memory: the ids the order remembers; a reply to a message older than that waits `ParentHold` | kolo-gossip's `MaxSeen`, the ids it keeps for duplicates | set it |
 | `EventQueue` | 1,024 | memory: events not yet read with `Next`; when it is full the room stops reading its topic, so gossip drops for this room only | kolo-braid's `MaxEvents`, the events it queues for `Next` | set it |
-| `PastEpoch` | 10 seconds | how long a message of the previous epoch is still accepted, so messages in flight when a Commit applies are not lost; it is also the time a removed device can still send under its old key | kolo-mls's `PastEpochWindow` | set it |
+| `PastEpoch` | 10 seconds | how long a message of the previous epoch is still accepted, so messages in flight when a Commit applies are not lost; it is also the time a removed device can still send under its old key and stays connected, so the Commit that removes it reaches it | kolo-mls's `PastEpochWindow` | set it |
 | `MaxSkew` | 1 minute | how far ahead of its envelope the time inside a message may be (a message published again is older than its envelope and is not refused for that); the author already chooses the envelope's time inside this window, so the bound adds no power over the order | kolo-gossip's `MaxAge` and `MaxSkew` | set it |
 | `MaxTreeBytes` | 128 MiB | memory of a device that joins: the ratchet tree it accepts | kolo-mls's `DefaultMaxTreeBytes` | set it |
 
@@ -83,11 +83,26 @@ The cost of the links does not depend on the number of members, since a link hol
 
 The walk writes the keys it derives with one write for each call of `History` that needs a key, so a joiner pays one write for each epoch it loads (4 ms on Pebble on the machine of the runs above, most of it the disk sync).
 
+## Policy, the read link and leaving
+
+None adds a field to `room.Limits`. What each costs and what bounds it:
+
+| What | Size or cost | Bound and basis | To raise it |
+|---|---|---|---|
+| the policy extension | 70 bytes with one poster and a read link, 134 with 3, 3,238 with 100, 320,039 with 10,000 (32 bytes for each poster or device, 32 for the read secret, 6 for the rest) | a Commit that changes it travels in one gossip message, so `SetPolicy` refuses one that does not fit `MaxMessageSize` with `ErrTooLarge`; the decoder also bounds each list by the bytes it holds | `MaxMessageSize` |
+| the state of an epoch for the readers | 514 bytes sealed for one admin that is the one poster; 267 bytes for each admin and each device that may post | one control log entry at most `MaxMessageSize` long: `writeRead` refuses a larger one with `ErrTooLarge` and readers refuse it | `MaxMessageSize` |
+| a read link | 779 bytes with one control log | the state it holds is bounded as above; its log headers by `maxHeader` each | |
+| a reader installing a state | 4 microseconds (open, decode the certificates, build the view) | none needed | |
+| a request to leave | one byte of body | one gossip message, under the rate of the device; sent again every `RepublishAfter` while `Leave` waits | `RepublishAfter` |
+
+These come from `TestMeasureReaders` (`KOLO_GROUP_MEASURE=1`, one run on a laptop under a load of 10 to 13). A reader keeps in memory one view (the admins' and posters' certificates) and one key for each epoch it has read, as a member does for the epochs it was in. The state of an epoch costs the same for 3 members and for 100,000 readers, since it is written once by each admin. What the link readers cost the nodes that serve them (connections, pulls of the admins' logs) is not measured: the largest run of this app is 64 devices.
+
 ## Not built yet
 
 - **Wake-up of closed phones** (not built): it needs the mobile apps and a relay run by the app's owner.
 - **Published build** (blocked): `GOWORK=off` builds fail until kolo-mls and kolo-gossip have a release.
 - **Segment sizes at 30,000 members** (not measured): the runs above go to 64 devices.
+- **Readers at 100,000** (not measured): see the section on policy and the read link.
 
 ## What the room can still lose
 

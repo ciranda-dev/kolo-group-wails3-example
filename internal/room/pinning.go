@@ -25,14 +25,15 @@ func (r *Room) pinSoon(l *roomLog) {
 func (r *Room) dirtyAny() bool {
 	r.dmu.Lock()
 	defer r.dmu.Unlock()
-	return len(r.dirty) > 0
+	return len(r.dirty)+len(r.pushing) > 0
 }
 
 func (r *Room) dirtyLog(l *roomLog) bool {
 	r.dmu.Lock()
 	defer r.dmu.Unlock()
-	_, ok := r.dirty[l]
-	return ok
+	_, dirty := r.dirty[l]
+	_, pushing := r.pushing[l]
+	return dirty || pushing
 }
 
 // pinLoop pushes the logs this admin wrote to the pins, at most once each PinGap.
@@ -50,7 +51,7 @@ func (r *Room) pinLoop() {
 		}
 		r.dmu.Lock()
 		batch := r.dirty
-		r.dirty = map[*roomLog]struct{}{}
+		r.dirty, r.pushing = map[*roomLog]struct{}{}, batch
 		r.dmu.Unlock()
 		var perr error
 		for l := range batch {
@@ -62,7 +63,7 @@ func (r *Room) pinLoop() {
 			}
 		}
 		r.dmu.Lock()
-		r.pinErr = perr
+		r.pinErr, r.pushing = perr, nil
 		retry := len(r.dirty) > 0
 		r.dmu.Unlock()
 		if retry && r.ctx.Err() == nil {

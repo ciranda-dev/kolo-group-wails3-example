@@ -2,46 +2,11 @@ package room
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"errors"
 	"testing"
-
-	kolomls "github.com/ciranda-dev/kolo-mls"
 )
 
-func TestPolicyRoundTripAndRefusals(t *testing.T) {
-	for _, p := range []histPolicy{{}, {Rule: SinceEpoch, Since: 7}, {Rule: NoHistory}} {
-		got, err := decodeHistPolicy(p.encode())
-		if err != nil || got != p {
-			t.Errorf("%+v: %+v %v", p, got, err)
-		}
-	}
-	for name, b := range map[string][]byte{
-		"nothing":            nil,
-		"another version":    {1, 0, 0},
-		"an unknown rule":    {0, 3, 0},
-		"an epoch with all":  {0, 0, 5},
-		"an epoch with none": {0, 2, 5},
-		"no epoch":           {0, 1},
-		"trailing bytes":     {0, 0, 0, 0},
-	} {
-		if _, err := decodeHistPolicy(b); !errors.Is(err, ErrMalformed) {
-			t.Errorf("%s: %v", name, err)
-		}
-	}
-	if p, err := policyOf(nil); err != nil || p != (histPolicy{}) {
-		t.Errorf("a room with no policy: %+v %v", p, err)
-	}
-	exts := []kolomls.Extension{{Type: 1}, histPolicy{Rule: SinceEpoch, Since: 3}.extension()}
-	if p, err := policyOf(exts); err != nil || p.Since != 3 {
-		t.Errorf("policyOf: %+v %v", p, err)
-	}
-	if _, err := policyOf([]kolomls.Extension{{Type: policyExtension, Data: []byte{9}}}); err == nil {
-		t.Error("a bad policy extension")
-	}
-}
-
-func TestPolicyDecidesWhichLinksExist(t *testing.T) {
+func TestHistoryRuleDecidesWhichLinksExist(t *testing.T) {
 	for _, c := range []struct {
 		p     histPolicy
 		epoch uint64
@@ -54,6 +19,8 @@ func TestPolicyDecidesWhichLinksExist(t *testing.T) {
 		{histPolicy{Rule: SinceEpoch, Since: 5}, 5, 9, false, 5},
 		{histPolicy{Rule: SinceEpoch, Since: 5}, 6, 9, true, 5},
 		{histPolicy{Rule: SinceEpoch, Since: 5}, 6, 3, true, 3},
+		{histPolicy{Rule: AllHistory, Since: 5}, 5, 9, false, 5},
+		{histPolicy{Rule: AllHistory, Since: 5}, 6, 9, true, 5},
 		{histPolicy{Rule: NoHistory}, 6, 9, false, 9},
 	} {
 		if got := c.p.allows(c.epoch); got != c.allow {
@@ -65,18 +32,27 @@ func TestPolicyDecidesWhichLinksExist(t *testing.T) {
 	}
 }
 
-func TestPolicyValidate(t *testing.T) {
-	if p, err := (Policy{History: SinceEpoch, Since: 4}).validate(); err != nil || p.Since != 4 {
-		t.Errorf("a good policy: %+v %v", p, err)
-	}
-	for name, p := range map[string]Policy{"an unknown rule": {History: 3}, "an epoch with all": {Since: 1}, "an epoch with none": {History: NoHistory, Since: 1}} {
-		if _, err := p.validate(); !errors.Is(err, ErrInvalid) {
-			t.Errorf("%s: %v", name, err)
-		}
-	}
-	for _, p := range []Policy{{ReadLink: true}, {Posters: []ed25519.PublicKey{{1}}}} {
-		if _, err := p.validate(); !errors.Is(err, ErrNotImplemented) {
-			t.Errorf("%+v: %v", p, err)
+// A rule set by a Commit holds from the next epoch, and history that was cut is never joined again.
+func TestHistoryRuleNext(t *testing.T) {
+	all, none := histPolicy{}, histPolicy{Rule: NoHistory}
+	for _, c := range []struct {
+		name      string
+		old, want histPolicy
+		epoch     uint64
+		got       histPolicy
+	}{
+		{"all stays all", all, all, 9, all},
+		{"all to none", all, none, 9, none},
+		{"none stays none", none, none, 9, none},
+		{"none to all reaches back to the cut", none, all, 9, histPolicy{Rule: AllHistory, Since: 9}},
+		{"none to since after the cut", none, histPolicy{Rule: SinceEpoch, Since: 20}, 9, histPolicy{Rule: SinceEpoch, Since: 20}},
+		{"none to since before the cut", none, histPolicy{Rule: SinceEpoch, Since: 3}, 9, histPolicy{Rule: SinceEpoch, Since: 9}},
+		{"since to all keeps the cut", histPolicy{Rule: SinceEpoch, Since: 5}, all, 9, histPolicy{Rule: AllHistory, Since: 5}},
+		{"since to an earlier since keeps the cut", histPolicy{Rule: SinceEpoch, Since: 5}, histPolicy{Rule: SinceEpoch, Since: 2}, 9, histPolicy{Rule: SinceEpoch, Since: 5}},
+		{"all to a later since", all, histPolicy{Rule: SinceEpoch, Since: 30}, 9, histPolicy{Rule: SinceEpoch, Since: 30}},
+	} {
+		if got := c.old.next(c.want, c.epoch); got != c.got {
+			t.Errorf("%s: %+v", c.name, got)
 		}
 	}
 }
@@ -114,16 +90,6 @@ func TestLinkOpensOnlyWithTheNextKeyOfTheSameRoomAndEpoch(t *testing.T) {
 			t.Errorf("%d bytes: %v", len(b), err)
 		}
 	}
-}
-
-func FuzzDecodeHistPolicy(f *testing.F) {
-	f.Add(histPolicy{}.encode())
-	f.Add(histPolicy{Rule: SinceEpoch, Since: 1 << 40}.encode())
-	f.Fuzz(func(t *testing.T, b []byte) {
-		if p, err := decodeHistPolicy(b); err == nil && !bytes.Equal(p.encode(), b) {
-			t.Fatal("a policy does not encode back to its bytes")
-		}
-	})
 }
 
 func FuzzOpenLink(f *testing.F) {

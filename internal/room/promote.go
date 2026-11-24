@@ -103,7 +103,7 @@ func (r *Room) Promote(ctx context.Context, device ed25519.PublicKey, role Role)
 	next := *v.roles
 	next.Admins = append(slices.Clone(v.roles.Admins), dev)
 	slices.SortFunc(next.Admins, func(a, b [32]byte) int { return bytes.Compare(a[:], b[:]) })
-	exts, err := groupExtensions(&next, v.hist)
+	exts, err := groupExtensions(&next, v.pol)
 	if err != nil {
 		return err
 	}
