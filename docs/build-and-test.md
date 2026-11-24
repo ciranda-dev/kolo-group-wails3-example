@@ -18,7 +18,9 @@ go build -tags production -o bin/kolo-group .
 - `build_test.go`: the development version in the build files, `scripts/set-version.sh`, the version in every build task and the installer files.
 - `config_test.go` and `groupservice_test.go`: the flags, the environment default, the service and the headless stub.
 - `readme_test.go`: the links of the README and the docs, and the commands of the README.
-- `internal/room/room_test.go`: every method that is not built returns `room: not implemented`.
+- `internal/room`: the live room on 127.0.0.1 with real swarm connections (`live_test.go`, `scale_test.go` for 64 devices, skipped with `-short`), hostile messages (`hostile_test.go`), the order of messages (`order_test.go`), the decoders and their fuzz tests (`wire_test.go`), and the methods that are not built (`misc_test.go`). The 64-device test runs 64 swarms in one process: check `uptime` first and run it when the load is under 10.
+
+Run a fuzz test for a while with `go test -run xxx -fuzz FuzzDecodeContent -fuzztime 30s ./internal/room`.
 
 ## Release files
 
