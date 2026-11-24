@@ -2,7 +2,7 @@
 
 <h1 align="center">Kolo Group</h1>
 
-<p align="center"><b>An example desktop group chat for Kolo, in progress: today it opens a window with an empty room list.</b></p>
+<p align="center"><b>An example desktop group chat for Kolo: end-to-end encrypted, live over gossip, kept for the offline on pins, with the history for new members.</b></p>
 
 <p align="center"><a href="docs/how-it-works.md">Docs</a> · <a href="CHANGELOG.md">Changelog</a></p>
 
@@ -12,11 +12,13 @@ This repository is private and experimental. It builds only inside the Kolo work
 
 ## What it does
 
-- **Show the app window** with its title and an empty list of rooms.
-- **Take two flags**: `-data` for the data folder and `-headless`, which fails with an error until headless mode is built.
-- **Run a room in `internal/room`** (tested, not yet used by the window): create a room, add, remove and promote members through settled Commits, send messages sealed with a key of the MLS epoch over gossip, and read them in causal order. Admins keep the messages in their own logs, pins mirror them, members serve them to each other, and a device that was offline catches up from them, also after a restart. A Commit of any size reaches the members as a short announcement and a pull by hash, and a joiner pulls the encrypted tree from the devices that serve it. Only member devices connect, and a removed device reads nothing sent after its removal.
-- **Give history to new members** (in `internal/room`): a room keeps all its history by default, or from a chosen epoch, or none, and a new member reads it backward through a chain of keys. This costs forward secrecy of the past, which [Security](docs/security.md) says.
-- **Let a room choose who may post, read by a link, and leave** (in `internal/room`): a policy lists the persons or devices that may post, so the other members read and cannot post; an admin changes it for the epochs from the next on; a room with few posters can give a read link that lets anyone read, with no secrecy (see [Security](docs/security.md)); and a member can leave. [How it works](docs/how-it-works.md) says what is built and what is planned.
+- **Create a room** with a name, a history rule for new members (all, from now on, or none) and who may post (every member, only admins, or chosen members), with a read link if you want a broadcast room.
+- **Talk live**: a room list, the conversation with replies, and the order every member sees the same. Messages are sealed with a key of the MLS epoch and travel over gossip; admins keep them for the people who are offline and pins mirror them.
+- **Add people**: a device makes a key package, an admin adds it and gives back a welcome, and the device joins. A read link lets anyone read a broadcast room and cannot post.
+- **Manage the room**: members and admins (make a device an admin, remove a person, choose who may post), the room's status (epoch, catching up, pins, devices connected), settings with the pins, entry nodes and relays the app was started with, and leaving.
+- **Scroll back**: the messages this device was told of, and, for a member who joined late, the history before the join as far as the room's rule allows.
+- **Run with no window**: `-headless` is an always-on device over the same data folder. Made an admin, it writes the segments of its rooms and pushes them to the pins, so a room can be read by people who were away while every person's computer is off.
+- **Run the room code** in `internal/room`: the live room, segments, catch-up, history, posters, the read link, leaving, Commits carried by reference and the encrypted tree served to joiners. [How it works](docs/how-it-works.md) says what is built and what is planned.
 
 ## Platforms
 
@@ -36,16 +38,44 @@ You need Go 1.26.0 or later, Node.js with npm, and the Wails 3 CLI (`go install 
 wails3 generate bindings -clean=true -time-type=Date
 (cd frontend && npm ci && npm run build)
 go build -tags production -o bin/kolo-group .
-./bin/kolo-group -data "$(mktemp -d)"
 ```
 
-`wails3 build` runs `go mod tidy`, which cannot find kolo-mls and kolo-gossip until they have a release, so the first three commands are the steps it runs, without that one. The window shows the title and an empty room list. Tests: `go test ./...`. Live reload: `KOLO_GROUP_DATA="$(mktemp -d)" wails3 dev`.
+`wails3 build` runs `go mod tidy`, which cannot find kolo-mls and kolo-gossip until they have a release, so these three commands are the steps it runs, without that one. Tests: `go test -p 2 ./...` and `(cd frontend && npm test)`. Live reload: `KOLO_GROUP_DATA="$(mktemp -d)" wails3 dev`.
+
+### Quick start on one computer
+
+Start an entry node for the two windows (`kolo-node run -listen 127.0.0.1:7447 -identity /tmp/kolo-group-demo/node.key -first`), then two people:
+
+```sh
+./bin/kolo-group -data "$(mktemp -d)" -bootstrap 127.0.0.1:7447
+./bin/kolo-group -data "$(mktemp -d)" -bootstrap 127.0.0.1:7447
+```
+
+In the first window choose "+", then Create a room. In the second choose "+", Join a room, and Make a key package; copy it. In the first, open Add, paste the key package and Add: copy the welcome it shows and paste it in the second window's Join. Both windows are now in the room: send a message, reply to one, and open Members and Status.
+
+### An always-on admin
+
+`-headless` runs the same app with no window, from flags or a JSON config file (the keys are the names of the flags: `data`, `bootstrap`, `listen`, `pin`, `pin-file`, `pin-ttl`, `lookup-interval`, `relay`, `relay-file`, `welcome-file`). Precedence: flag, then file, then `KOLO_GROUP_*` variable, then default.
+
+```json
+{
+  "bootstrap": "127.0.0.1:7447",
+  "listen": "127.0.0.1:0",
+  "welcome-file": "welcome.txt"
+}
+```
+
+```sh
+./bin/kolo-group -headless -data "$(mktemp -d)" -config headless.json
+```
+
+With no room yet it prints a key package. Add it to a room in a window, write the welcome to `welcome.txt` (the app reads it every 2 seconds and joins once), then make the device an admin in the member list. Run it as a service on a computer that stays on, with the folder of a real `-data` and, for people who are offline, `-pin` (see [configuration](docs/how-it-works.md#configuration)).
 
 ## How it uses Kolo
 
-The libraries below are the direct requirements of `go.mod`. `internal/room` uses them; the window does not call it yet.
+The libraries below are the direct requirements of `go.mod`. `internal/room` composes them and the window and `-headless` run it.
 
-| Kolo library | What the app will use it for |
+| Kolo library | What the app uses it for |
 |---|---|
 | [kolo-mls](https://github.com/ciranda-dev/kolo-mls) | end-to-end encryption of each room by MLS (RFC 9420) |
 | [kolo-gossip](https://github.com/ciranda-dev/kolo-gossip) | live delivery of signed messages to the members online |
@@ -60,16 +90,17 @@ The libraries below are the direct requirements of `go.mod`. `internal/room` use
 ## Project layout
 
 ```text
-main.go, config.go         the window and the flags
-groupservice.go            the Wails service the window calls
-headless.go                the -headless stub
+main.go, config.go         the window, the flags and the config file
+groupservice.go, rooms.go  the Wails service the window calls and what it shows
+device.go, messages.go     the device (keys, stores, swarm, node) and the messages the window was told of
+headless.go, relay.go      the -headless mode and the state of the connection relays
 internal/room/             the room: Node, Room, sealing, order, admission, segments, catch-up
-frontend/                  the window (Vite)
-build/, scripts/           icons, installers and release scripts
+frontend/                  the window (Vite and React, in English, Spanish and Portuguese)
+build/, scripts/           icons, installers, release scripts and the 30,000-member tests
 docs/                      how it works, security, limits, build and test
 ```
 
 ## Learn more
 
-- [How it works](docs/how-it-works.md), [security](docs/security.md), [limits](docs/limits.md), [build and test](docs/build-and-test.md)
+- [How it works](docs/how-it-works.md), [security](docs/security.md), [limits](docs/limits.md), [build and test](docs/build-and-test.md) (the 30,000-member tests run with `task test-30k`)
 - [Changelog](CHANGELOG.md), [security policy](SECURITY.md), license: [Apache-2.0](LICENSE)

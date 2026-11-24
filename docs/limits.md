@@ -45,7 +45,7 @@ An admin on Pebble commits every entry to disk before it goes on: an append took
 | pieces of a tree an invite names | `MaxTreeBytes` divided by the piece size, plus 2 | a join pulls at most this many entries, and stops when it has them | the bound above |
 | piece of a Commit or of a tree (`maxChunk`) | 1 MiB | what a member reads for one entry of a control log or tree log | kolo-sync answers a request for entries with about 1 MiB, so a piece fits one answer; with kolo-log's padding (at most about 6 percent) it is far under kolo-sync's 4 MiB message |
 | a Commit read from the control logs | kolo-mls's `MaxCommitBytes` (128 MiB) | memory: the pieces are counted as they are read | kolo-mls's default |
-| room name | 256 bytes | the size of an invite | UNSOURCED: a display name, which the window will limit |
+| room name | 256 bytes | the size of an invite | UNSOURCED: a display name; the window shows the error of `Create` for a longer one |
 | signed log header in a record | 512 bytes | the size of a record of the control log, an invite and a request to be promoted | measured: a header is 157 bytes |
 | join request and welcome of the braid | 64 KiB and 1 MiB | what a device reads from a room message about a promotion | kolo-braid's `MaxJoinRequest` and `MaxWelcome`; measured: 202 and 549 bytes |
 | a SettledCommit in a control log | `MaxMessageSize` | what a member reads for one key | the room's gossip message |
@@ -101,11 +101,27 @@ None adds a field to `room.Limits`. What each costs and what bounds it:
 
 These come from `TestMeasureReaders` (`KOLO_GROUP_MEASURE=1`, one run on a laptop under a load of 10 to 13). A reader keeps in memory one view (the admins' and posters' certificates) and one key for each epoch it has read, as a member does for the epochs it was in. The state of an epoch costs the same for 3 members and for 100,000 readers, since it is written once by each admin. What the link readers cost the nodes that serve them (connections, pulls of the admins' logs) is not measured: the largest run of this app is 64 devices.
 
+## Bounds of the app
+
+The window and `-headless` add no cap on rooms, members, messages or message length: the bounds above are the room's. What they add is how much is read or drawn at once, and how often the app asks.
+
+| Value | What it is for | Basis |
+|---|---|---|
+| 50 messages a page | one read of the messages kept for the window, and of the history before the join | a screen of messages; each page is a request, a room has no limit |
+| 100 devices a page | one read of the member list, and the rows drawn at once; a room of 30,000 draws 100 (and the admins) until the person asks for more | the 30,000-device test of the window (`frontend/src/window.test.js` with a mock of 30,000, `members.test.js`) |
+| one action at a time | creating, joining, adding, promoting, removing, changing the policy and leaving wait for other devices, and the window keeps one wait to stop | the room asks no concurrency of the window |
+| 2 s to 30 s | the wait before asking the entry nodes again, doubling | the other Kolo apps' wait |
+| 2 s | how often `-welcome-file` is read | a poll of a file the owner writes by hand |
+| 2 s | how often the window asks for the status of the room on screen | the status holds the connections of the swarm, which tell nothing by events |
+| 64 KiB | the size of the config file and of each pin and relay file | kolo-node's bound for its config file |
+
+The messages the window keeps grow with the room, one record each, and are deleted with the room. The pins are the user's list: no count is capped.
+
 ## Not built yet
 
 - **Wake-up of closed phones** (not built): it needs the mobile apps and a relay run by the app's owner.
 - **Published build** (blocked): `GOWORK=off` builds fail until kolo-mls and kolo-gossip have a release.
-- **Segment sizes at 30,000 members** (not measured): the runs above go to 64 devices.
+- **Segment sizes at 30,000 members** (not measured): the runs above go to 64 devices. `task test-30k` runs the tests that build a group of 30,000 leaves (see [build and test](build-and-test.md)); their numbers are not recorded here.
 - **Readers at 100,000** (not measured): see the section on policy and the read link.
 
 ## What the room can still lose

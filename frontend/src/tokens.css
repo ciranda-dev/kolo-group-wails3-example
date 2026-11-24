@@ -1,0 +1,15 @@
+:root {
+  /* Kolo brand, dark theme */
+  --bg: #070b12;
+  --panel: #0c121c;
+  --border: #1a2536;
+  --accent: #6ab5fb;
+  --accent-2: #eef3fb;
+  --text: #eef3fb;
+  --muted: #98a6ba;
+  --on-accent: #06121f;
+  --radius: 12px;
+  --radius-pill: 999px;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  color-scheme: dark;
+}

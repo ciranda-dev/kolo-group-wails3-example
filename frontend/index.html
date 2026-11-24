@@ -3,17 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'" />
+    <link rel="icon" type="image/svg+xml" href="/src/assets/kolo-mark.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Kolo Group</title>
   </head>
   <body>
-    <main>
-      <h1>Kolo Group</h1>
-      <p id="version"></p>
-      <h2>Rooms</h2>
-      <ul id="rooms"></ul>
-      <p id="empty">No rooms yet. Rooms are not built yet.</p>
-    </main>
-    <script type="module" src="/src/main.js"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

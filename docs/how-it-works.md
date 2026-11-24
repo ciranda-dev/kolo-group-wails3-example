@@ -1,6 +1,6 @@
 # How it works
 
-Kolo Group is an example app. The room is built in `internal/room`: creating a room, adding and removing members, promoting a second admin, choosing who may post, reading a room from a read link, leaving a room, carrying Commits by reference and serving the encrypted tree to joiners, sending and reading messages live, storing them for the offline in the admins' segments, catching up after an absence, reading the room's history after joining it, and reopening every room after a restart. The window does not use it yet, and everything marked planned is not built.
+Kolo Group is an example app. The room is built in `internal/room`: creating a room, adding and removing members, promoting a second admin, choosing who may post, reading a room from a read link, leaving a room, carrying Commits by reference and serving the encrypted tree to joiners, sending and reading messages live, storing them for the offline in the admins' segments, catching up after an absence, reading the room's history after joining it, and reopening every room after a restart. The window and `-headless` run it, and everything marked planned is not built.
 
 ## What is built
 
@@ -63,8 +63,58 @@ The code is the same as for 3 members: there is no mode and no threshold. Reader
 - **Authors that left before the join** (not built): a joiner holds the certificates of the devices that are, or were since it joined, in the room. A message of a device that left earlier is reported by `History` with `ErrUnknownAuthor`, since no library gives the credentials of past members.
 - **A tree log written by a device that is no admin** (not built): only the admin that adds writes the tree log of the epoch it makes; the other admins and the members that serve replicate it.
 - **Hints of new heads on gossip** (not built; the kolo-sync watch already tells every connected peer when a log grows).
-- **The window, invites and `-headless`** (planned).
 - **Wake-up of offline devices** (planned, needs the mobile apps).
+- **Names and profiles** (not built): a person shows as the first 8 characters of its key, and a person has the same key in every room.
+- **A second device of one person** (not built): each device here has its own person key, made at the first start. `-headless` is therefore a person of its own that an admin adds and promotes.
+- **Notifications and settings changed in the window** (not built): the app does not tell the system of a message, and the pins, relays and entry nodes are set at start.
+- **Join progress** (not built): a join shows "Joining" until it ends or is stopped; the room reports no steps.
+
+## The window and -headless
+
+The window is a Wails 3 app over one Go service (`GroupService`), with a frontend in Vite and React that copies the structure and style of the other Kolo apps and speaks English, Spanish and Portuguese. A `device` (`device.go`) is what both modes run: it opens the data folder, makes or loads the keys, opens the stores, starts the swarm (kolo-swarm), gossip and the room node, serves every connection to the node, and asks the entry nodes again by itself, waiting 2 seconds and then up to 30, while none answers.
+
+- **The data folder** is the same in both modes, so a folder made by the window runs headless and the other way round, with the same keys and rooms:
+
+  ```text
+  <data>/                0700
+    layout.json          {"layout":1}; another layout is refused and nothing is changed
+    person.key           the person's kolo-id
+    device.key           this device's kolo-id
+    device.cert          the person's certificate for this device
+    mls/ state/ logs/    the MLS state, the rooms' state with the admins' braid, the logs
+    app/                 the messages the window was told of
+    welcomes             the hashes of the welcomes that -welcome-file has joined (headless)
+  ```
+
+  A folder that other users can open is refused. Each person is one key and one device here; adding another device of the same person is not built.
+- **The messages the window shows.** A room delivers each message once, so the window keeps what it was told of in `app/` (the numbers of the messages and one record each): after a restart it reads them from there, a page of 50 at a time, and a room that this device left or was removed from forgets them. The history before the join comes from `History` (the keys of the epochs before, the admins' segments), a page at a time, and is not kept: it is read again when asked. A room joined with a read link is not kept across a restart, so its messages are not either.
+- **Create, join and add.** A new room takes a name, the history rule (all, none) and who may post (every member, only admins), and a read link when posters are limited. A device that wants to join makes a key package (`kolo-group-key:` and base64), gives it to an admin, who adds it and gives back a welcome (`kolo-group-welcome:`) that the device pastes to join. A read link is `kolo-group-link:` and the same way to paste. The three texts have different prefixes so one pasted in the wrong place is refused with a clear message.
+- **One action at a time.** Creating, joining, adding, promoting, removing, changing the policy and leaving can wait for other devices (a settled Commit needs the settlers, a leave needs an admin). The window runs one at a time and shows a button that stops the wait (`CancelAction`); the room then stops waiting and keeps its state.
+- **Members** are shown the admins first and the other devices a page of 100 at a time, so a room of 30,000 is never drawn at once. An admin makes a device an admin (the room sends the offer again until the device is online and answers, and the stop button ends the wait), removes a person, and, when only chosen persons may post, says who.
+- **Status** shows the epoch, whether the device is catching up, the other devices of the room connected now, the other admins online, the messages that no admin keeps yet, the logs held, and the last error of a push to the pins.
+- **Settings** show the network, the pins and the relays the app was started with, and the device and person keys that an admin needs. They are not changed in the window.
+- **`-headless`** runs the device with no window until it gets SIGINT or SIGTERM. With no room it prints a key package. It joins the room of the welcome in `-welcome-file` (read every 2 seconds, each welcome once), and, once an admin of the room promotes it, it writes the room's segments and pushes them to the pins as any admin does. It logs who it is, its rooms, and when its members change or it is removed; never a message.
+
+### Configuration
+
+Every setting is a flag, a key of the JSON config file (`-config`, at most 64 KiB, an unknown key is an error) under the name of its flag, or a `KOLO_GROUP_*` variable. A flag wins over the file, the file over the variable, and a list given by a flag replaces the rest.
+
+| Flag | Variable | Default | Meaning |
+|---|---|---|---|
+| `-data` | `KOLO_GROUP_DATA` | `<user config dir>/kolo-group` | the data folder |
+| `-headless` | | off | run with no window |
+| `-config` | | none | the JSON config file |
+| `-bootstrap` | `KOLO_GROUP_BOOTSTRAP` | the public network | `host:port` of the entry nodes of your own network, comma-separated, used alone |
+| `-listen` | `KOLO_GROUP_LISTEN` | `127.0.0.1:0` when every entry node is on loopback, else `0.0.0.0:0` | the local address |
+| `-pin` | `KOLO_GROUP_PIN` | none | pins as `IP:PORT@KEY`, comma-separated, repeatable |
+| `-pin-file` | `KOLO_GROUP_PIN_FILE` | none | files of pins, one or more per line, `#` starts a comment |
+| `-pin-ttl` | `KOLO_GROUP_PIN_TTL` | `720h` | the lifetime of the capabilities for the pins |
+| `-lookup-interval` | `KOLO_GROUP_LOOKUP_INTERVAL` | `5s` | the time between lookups of the room topics |
+| `-relay` | `KOLO_GROUP_RELAYS` | none | connection relays as `host:port@key`; the variable is read only when no `-relay` or `-relay-file` is given |
+| `-relay-file` | | none | files of relays, one or more per line |
+| `-welcome-file` | `KOLO_GROUP_WELCOME_FILE` | none | with `-headless`, the file an admin's welcome is written to |
+
+Addresses are IPv4. A bad setting stops the app with an error that starts with `kolo-group: -<flag>` and names the setting; `errors.Is(err, ErrConfig)` holds for each. The pins of a room are the pins of the device: they are not part of the invite, so every admin device lists the same pins itself.
 
 ## Design that is planned
 
