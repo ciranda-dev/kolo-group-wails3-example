@@ -427,23 +427,29 @@ func (n *Node) Join(ctx context.Context, welcome []byte) (*Room, error) {
 	return r, nil
 }
 
-// Room returns the room with the given id.
+// Room returns the room with the given id, or ErrRemoved once this device left it or was removed from it.
 func (n *Node) Room(id GroupID) (*Room, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if r := n.rooms[id]; r != nil {
-		return r, nil
+	r := n.rooms[id]
+	switch {
+	case r == nil:
+		return nil, ErrUnknownRoom
+	case r.removed.Load():
+		return nil, ErrRemoved
 	}
-	return nil, ErrUnknownRoom
+	return r, nil
 }
 
-// Rooms returns every room of the node.
+// Rooms returns the rooms of the node that this device has not left or been removed from.
 func (n *Node) Rooms() []*Room {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	out := make([]*Room, 0, len(n.rooms))
 	for _, r := range n.rooms {
-		out = append(out, r)
+		if !r.removed.Load() {
+			out = append(out, r)
+		}
 	}
 	return out
 }
