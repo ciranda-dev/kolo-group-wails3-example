@@ -1,6 +1,6 @@
 # Build and test
 
-Run the commands in this folder while it sits in the Kolo workspace. `GOWORK=off` does not work yet: kolo-mls and kolo-gossip have no release.
+The repository has no `go.work` and no `replace`, so use `GOWORK=off` when this folder sits inside a Go workspace.
 
 ```sh
 gofmt -l .
@@ -12,7 +12,7 @@ wails3 generate bindings -clean=true -time-type=Date
 go build -tags production -o bin/kolo-group .
 ```
 
-`wails3 build` runs `go mod tidy`, which cannot find kolo-mls and kolo-gossip until they have a release. The generate, build and go build commands are the steps it runs, without that one.
+The generate, build and go build commands are the steps `wails3 build` runs.
 
 ## What the tests cover
 
@@ -27,7 +27,7 @@ Run a fuzz test for a while with `go test -run xxx -fuzz FuzzDecodeContent -fuzz
 
 ## The 30,000-member tests
 
-`task test-30k` (or `scripts/test-30k.sh`; `--dry-run` prints the commands) runs three steps and is the only place they run: no workflow does, since they need the private libraries, about 13 GB of memory and hours. It checks the load first (under 10, or `KOLO_GROUP_FORCE=1`).
+`task test-30k` (or `scripts/test-30k.sh`; `--dry-run` prints the commands) runs three steps and is the only place they run: no workflow does, since they need the Kolo workspace with a kolo-gossip checkout, about 13 GB of memory and hours. It checks the load first (under 10, or `KOLO_GROUP_FORCE=1`).
 
 1. The gossip simulator of kolo-gossip at 30,000 nodes, scenarios S1, S2, S3, S7, S9, S10 and M1 (`KOLO_GOSSIP_DIR` names the folder, `KOLO_GOSSIP_MAXHEAP` stops the run past a heap, 13.2 GB by default, twice the 6.6 GB the simulator held at that size). The command exits 1 when a scenario fails its criteria.
 2. `TestMeasureReaders`: the sizes of a room of 100,000 readers.

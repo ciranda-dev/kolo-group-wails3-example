@@ -21,7 +21,7 @@ go build -tags production -o bin/kolo-group .
 cd frontend && npm run build
 ```
 
-The folder must sit in the Kolo workspace: `kolo-mls` and `kolo-gossip` have no release yet, so `GOWORK=off` builds fail until they do. Run `staticcheck ./...` too (`go install honnef.co/go/tools/cmd/staticcheck@latest`). `README.md` and `docs/build-and-test.md` explain how to run and build the app.
+Use `GOWORK=off` when the folder sits inside a Go workspace. Run `staticcheck ./...` too (`go install honnef.co/go/tools/cmd/staticcheck@latest`). `README.md` and `docs/build-and-test.md` explain how to run and build the app.
 
 ## Conventions
 

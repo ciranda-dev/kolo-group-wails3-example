@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The README and the docs no longer say the example is private, has no release or needs the Kolo workspace: it builds against the released libraries and the files are on the release.
+
 ## [0.1.0] - 2026-11-24
 
 ### Added
