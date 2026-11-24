@@ -264,6 +264,7 @@ func (r *Room) addRead(rec *ctlRecord) {
 	r.view.Store(v)
 	r.notify()
 	r.n.refreshMembers()
+	r.refreshPeers()
 	r.emit(Event{Kind: MembersChanged, Epoch: v.epoch})
 	r.kick()
 }

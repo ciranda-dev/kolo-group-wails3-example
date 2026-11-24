@@ -29,6 +29,7 @@ var (
 	ErrCatchUp         = errors.New("room: stored message not read")
 	ErrHistory         = errors.New("room: history not readable")
 	ErrLink            = errors.New("room: history link refused")
+	ErrEquivocation    = errors.New("room: two Commits settled for one epoch")
 	ErrTooManyLogs     = errors.New("room: too many logs followed")
 	ErrTooManyReceipts = errors.New("room: too many messages not stored yet")
 )

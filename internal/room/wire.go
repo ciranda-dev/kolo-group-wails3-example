@@ -264,14 +264,16 @@ func decodeStored(b []byte) (*stored, error) {
 
 // The kinds of a control log record.
 const (
-	ctlPut   byte = 1 // an object for settle.Pins: a Commit or a SettledCommit
-	ctlOpen  byte = 2 // a segment opened, with its log header
-	ctlClose byte = 3 // a segment closed, with its final size
-	ctlDir   byte = 4 // the control log of another admin
-	ctlLink  byte = 5 // the history link of an epoch
-	ctlRead  byte = 6 // the state of an epoch sealed under the room's read secret, for the readers of a read link
-	ctlChunk byte = 7 // a piece of a Commit or of a sealed tree, under the hash of the whole
-	ctlTree  byte = 8 // the log that holds the sealed tree of an epoch
+	ctlPut   byte = 1  // an object for settle.Pins: a Commit or a SettledCommit
+	ctlOpen  byte = 2  // a segment opened, with its log header
+	ctlClose byte = 3  // a segment closed, with its final size
+	ctlDir   byte = 4  // the control log of another admin
+	ctlLink  byte = 5  // the history link of an epoch
+	ctlRead  byte = 6  // the state of an epoch sealed under the room's read secret, for the readers of a read link
+	ctlChunk byte = 7  // a piece of a Commit or of a sealed tree, under the hash of the whole
+	ctlTree  byte = 8  // the log that holds the sealed tree of an epoch
+	ctlNext  byte = 9  // the last record of a control log: the admin goes on in the log of Header from Epoch
+	ctlPrev  byte = 10 // the first record of a control log of Epoch: the log of Header came before it
 )
 
 // maxChunk is the most bytes of one piece: kolo-sync answers a request for entries with about 1 MiB, so a piece fits one answer.
@@ -282,8 +284,8 @@ type ctlRecord struct {
 	Kind   byte
 	Key    string   // ctlPut
 	Value  []byte   // ctlPut, ctlLink, ctlRead
-	Epoch  uint64   // ctlOpen, ctlLink, ctlRead
-	Header []byte   // ctlOpen, ctlDir, ctlTree: the signed log header, so a reader opens the replica without asking anyone
+	Epoch  uint64   // ctlOpen, ctlLink, ctlRead, ctlTree, ctlNext, ctlPrev
+	Header []byte   // ctlOpen, ctlDir, ctlTree, ctlNext, ctlPrev: the signed log header, so a reader opens the replica without asking anyone
 	ID     [32]byte // ctlClose: the log; ctlChunk: the hash of the whole
 	Size   uint64   // ctlClose
 	Index  uint64   // ctlChunk: this piece, of Count
@@ -316,7 +318,7 @@ func (c *ctlRecord) encode() []byte {
 		e.PutUvarint(c.Index)
 		e.PutUvarint(c.Count)
 		e.PutBytes(c.Value)
-	case ctlTree:
+	case ctlTree, ctlNext, ctlPrev:
 		e.PutUvarint(c.Epoch)
 		e.PutBytes(c.Header)
 	}
@@ -369,7 +371,7 @@ func decodeCtl(b []byte, maxValue int) (*ctlRecord, error) {
 		if err == nil && (c.Count == 0 || c.Index >= c.Count || len(c.Value) == 0) {
 			err = errors.New("piece out of range")
 		}
-	case ctlTree:
+	case ctlTree, ctlNext, ctlPrev:
 		if c.Epoch, err = d.Uvarint(); err == nil {
 			c.Header, err = d.Bytes(maxHeader)
 		}

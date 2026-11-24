@@ -95,6 +95,7 @@ type tnode struct {
 	opts    tnodeOpts
 	mls     kolostore.Backend // what a restart keeps: the MLS state, the room's state and the logs
 	backend kolostore.Backend
+	logs    kolostore.Backend // the backend of store, in memory
 	store   *kolostore.Store
 
 	askedMu sync.Mutex
@@ -133,11 +134,14 @@ type tnodeOpts struct {
 	noServe bool                                         // the test serves no connection: a device that is no member
 	policy  Policy                                       // the policy a created room gets
 	serve   bool                                         // Config.ServeTree
+	// beforeOpen, when set, replaces the bootstrap of a start: it gets the swarm before the room node opens.
+	beforeOpen func(*koloswarm.Swarm)
 }
 
 func newTNode(t testing.TB, o tnodeOpts) *tnode {
 	t.Helper()
-	tn := &tnode{t: t, opts: o, person: o.person, dev: ident(t), mls: kolostore.NewMemory(), backend: kolostore.NewMemory(), store: kolostore.New(kolostore.NewMemory())}
+	tn := &tnode{t: t, opts: o, person: o.person, dev: ident(t), mls: kolostore.NewMemory(), backend: kolostore.NewMemory(), logs: kolostore.NewMemory()}
+	tn.store = kolostore.New(tn.logs)
 	if tn.person == nil {
 		tn.person = ident(t)
 	}
@@ -196,11 +200,21 @@ func (tn *tnode) start() {
 		t.Fatal(err)
 	}
 	tn.sw = sw
-	if o.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := sw.Bootstrap(ctx, []netip.AddrPort{addrOf(o.server.Addr())}); err != nil {
-			t.Fatal(err)
+	if o.beforeOpen != nil {
+		o.beforeOpen(sw)
+	} else if o.server != nil {
+		// One server on 127.0.0.1 serves every device of a test; under -race and a high load it can miss a few answers.
+		deadline := time.Now().Add(time.Minute)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err := sw.Bootstrap(ctx, []netip.AddrPort{addrOf(o.server.Addr())})
+			cancel()
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal(err)
+			}
 		}
 	}
 	if tn.g, err = kologossip.New(tn.dev, &kologossip.Config{Cert: tn.cert, Swarm: sw, HeartbeatInterval: 100 * time.Millisecond}); err != nil {

@@ -81,7 +81,8 @@ func Open(ctx context.Context, cfg *Config) (*Node, error) {
 		if len(owner) != ed25519.PublicKeySize || len(peer) != ed25519.PublicKeySize {
 			return kolosync.NoAccess
 		}
-		if r, ok := n.logRoom.Load(keyOf([32]byte(owner), id)); ok && r.(*Room).readableBy([32]byte(peer)) {
+		k := keyOf([32]byte(owner), id)
+		if r, ok := n.logRoom.Load(k); ok && r.(*Room).readableBy([32]byte(peer), k) {
 			return kolosync.Ciphertext
 		}
 		return kolosync.NoAccess
@@ -158,11 +159,39 @@ func (n *Node) isMember(key []byte) bool {
 	return ok || n.open.Load() || n.joining.Load() > 0
 }
 
-// readableBy reports whether a device may read the room's logs: a member, a device removed by the last Commit while its window
-// lasts, since it pulls that Commit from the logs, or anyone when the room has a read link.
-func (r *Room) readableBy(dev [32]byte) bool {
+// readableBy reports whether a device may read the room's log k: a member, a device removed by the last Commit while its
+// window lasts, since it pulls that Commit from the logs, or anyone when the room has a read link. A tree log has its own rule.
+func (r *Room) readableBy(dev [32]byte, k logKey) bool {
+	r.logMu.Lock()
+	l := r.logs[k]
+	r.logMu.Unlock()
 	v := r.view.Load()
+	if l != nil && l.tree {
+		return !r.reader && r.treeReadableBy(v, dev, l.epoch)
+	}
 	return r.reader || v.pol.link || v.author(dev) != nil || v.prev != nil && r.n.now().Before(v.prevUntil) && v.prev.author(dev) != nil
+}
+
+// treeReadableBy reports whether a device may read the tree log of epoch, the largest log of a room: an admin, a device
+// whose Welcome into epoch this admin made, a member that joined in that epoch, and, while it is the current epoch, any member, since a
+// member that serves trees replicates it. A reader of the read link and a removed device may not.
+func (r *Room) treeReadableBy(v *view, dev [32]byte, epoch uint64) bool {
+	if v.roles.Admin(dev[:]) {
+		return true
+	}
+	r.wmu.Lock()
+	at, welcomed := r.welcomed[dev]
+	r.wmu.Unlock()
+	if welcomed && at+1 == epoch {
+		return true
+	}
+	if v.author(dev) == nil {
+		return false
+	}
+	r.kmu.RLock()
+	first, ok := r.first[dev]
+	r.kmu.RUnlock()
+	return epoch == v.epoch || ok && first == epoch
 }
 
 // Allow is the admission rule for koloswarm.Config.Allow: only devices that are leaves of a room of this node, and
@@ -345,7 +374,7 @@ func (n *Node) Create(ctx context.Context, name string, p Policy) (*Room, error)
 	if err != nil {
 		return fail(err)
 	}
-	secret, err := m.Export(topicLabel, m.GroupID(), keySize)
+	secret, err := m.Export(secretLabel, m.GroupID(), keySize)
 	if err != nil {
 		m.Close()
 		return fail(err)

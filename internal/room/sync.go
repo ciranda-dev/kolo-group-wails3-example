@@ -1,6 +1,7 @@
 package room
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -166,8 +167,8 @@ func (r *Room) scanControl() (grew bool) {
 
 func (r *Room) reportOnce(l *roomLog, err error) {
 	r.logMu.Lock()
-	again := l.reported
-	l.reported = true
+	again := l.keyReported
+	l.keyReported = true
 	r.logMu.Unlock()
 	if !again {
 		r.emit(Event{Kind: CatchingUp, Err: fmt.Errorf("%w: %w", ErrCatchUp, err)})
@@ -181,6 +182,9 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 	case ctlPut, ctlChunk:
 		if r.indexRecord(l, i, rec) {
 			r.poke()
+		}
+		if rec.Kind == ctlPut && isSettled(rec.Key) {
+			r.checkLateSettled(rec)
 		}
 	case ctlOpen:
 		r.logMu.Lock()
@@ -208,6 +212,26 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 			r.persistLogLocked(s)
 		}
 		r.logMu.Unlock()
+	case ctlNext:
+		hd, err := kololog.DecodeLogHeader(rec.Header)
+		if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) {
+			return false
+		}
+		r.logMu.Lock()
+		l.done = true
+		r.persistLogLocked(l)
+		r.logMu.Unlock()
+		return r.addLog(l.owner, rec.Header, true, rec.Epoch)
+	case ctlPrev:
+		hd, err := kololog.DecodeLogHeader(rec.Header)
+		if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) {
+			return false
+		}
+		r.logMu.Lock()
+		l.epoch = max(l.epoch, rec.Epoch)
+		r.persistLogLocked(l)
+		r.logMu.Unlock()
+		r.notePrev(l.owner, rec)
 	case ctlDir:
 		hd, err := kololog.DecodeLogHeader(rec.Header)
 		if err != nil || len(hd.LogKey) != 32 {
@@ -287,10 +311,15 @@ func (r *Room) advanceOnce() bool {
 		r.mu.Unlock()
 		return false
 	}
-	e, max := r.m.Epoch(), r.m.MaxCommitBytes()
+	e, max, pins := r.m.Epoch(), r.m.MaxCommitBytes(), r.pins
 	r.mu.Unlock()
+	v := r.view.Load()
+	if v.epoch != e {
+		return false
+	}
 	key := settle.SettledKey(r.gid[:], e)
-	shares := len(r.view.Load().roles.Settlers)
+	shares := len(v.roles.Settlers)
+	member := func(d [32]byte) bool { return v.author(d) != nil }
 	var cands [][]byte
 	if h := r.hint.Load(); h != nil && h.epoch == e {
 		cands = append(cands, h.settled)
@@ -301,15 +330,25 @@ func (r *Room) advanceOnce() bool {
 		}
 	}
 	for _, sb := range cands {
-		if len(sb) > settledBound(shares) {
+		h := sha256Of(sb)
+		if len(sb) > settledBound(shares) || r.isBad(h) {
 			continue
 		}
 		st, err := settle.DecodeSettled(sb, shares)
 		if err != nil {
-			r.reportEpoch(e, sha256Of(sb), err)
+			r.reportEpoch(e, h, err)
 			continue
 		}
-		commit, err := settle.GetObject(r.ctx, r.pins, st.TBS.Commit, max)
+		// The signatures are checked before the Commit is fetched, so a SettledCommit that no quorum signed costs nothing.
+		if !bytes.Equal(st.TBS.GroupID, r.gid[:]) || st.TBS.Epoch != e || st.TBS.Braid != v.roles.Braid || st.Valid(v.roles, member) < v.roles.Q() {
+			r.reportEpoch(e, h, ErrCommitRef)
+			continue
+		}
+		r.sawSettled(e, st.TBS.Commit)
+		if r.isBad(st.TBS.Commit) {
+			continue
+		}
+		commit, err := settle.GetObject(r.ctx, pins, st.TBS.Commit, max)
 		if err != nil {
 			continue
 		}
@@ -341,6 +380,59 @@ func (r *Room) advanceOnce() bool {
 	return false
 }
 
+// seenCommit is the Commit a quorum of settlers signed for an epoch.
+type seenCommit struct {
+	hash     [32]byte
+	reported bool
+}
+
+// sawSettled takes note of a Commit that a quorum signed for epoch, and reports, once for the epoch, a second one: the
+// settlers forked the room, and each part of it may apply another Commit.
+func (r *Room) sawSettled(epoch uint64, hash [32]byte) {
+	r.mu.Lock()
+	for e := range r.settledIn {
+		if e+1 < epoch {
+			delete(r.settledIn, e)
+		}
+	}
+	s := r.settledIn[epoch]
+	fork := s != nil && s.hash != hash && !s.reported
+	switch {
+	case s == nil:
+		r.settledIn[epoch] = &seenCommit{hash: hash}
+	case fork:
+		s.reported = true
+	}
+	r.mu.Unlock()
+	if fork && r.ctx.Err() == nil {
+		r.emit(Event{Kind: CatchingUp, Epoch: epoch, Err: fmt.Errorf("%w: epoch %d has the Commits %x and %x", ErrEquivocation, epoch, s.hash[:4], hash[:4])})
+	}
+}
+
+// checkLateSettled takes note of a SettledCommit a control log holds for the epoch before the current one, if its quorum
+// holds, so a second Commit settled for an epoch this device has left is reported too.
+func (r *Room) checkLateSettled(rec *ctlRecord) {
+	v := r.view.Load()
+	p := v.prev
+	if p == nil || rec.Key != settle.SettledKey(r.gid[:], p.epoch) || len(rec.Value) > settledBound(len(p.roles.Settlers)) {
+		return
+	}
+	st, err := settle.DecodeSettled(rec.Value, len(p.roles.Settlers))
+	if err != nil || !bytes.Equal(st.TBS.GroupID, r.gid[:]) || st.TBS.Epoch != p.epoch || st.TBS.Braid != p.roles.Braid {
+		return
+	}
+	if st.Valid(p.roles, func(d [32]byte) bool { return p.author(d) != nil }) >= p.roles.Q() {
+		r.sawSettled(p.epoch, st.TBS.Commit)
+	}
+}
+
+func (r *Room) isBad(hash [32]byte) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, bad := r.badCommits[hash]
+	return bad
+}
+
 // reportEpoch reports a Commit that the control logs hold and the room cannot apply, once for each Commit.
 func (r *Room) reportEpoch(epoch uint64, hash [32]byte, err error) {
 	r.mu.Lock()
@@ -354,6 +446,7 @@ func (r *Room) reportEpoch(epoch uint64, hash [32]byte, err error) {
 
 // applied does what a new epoch asks of the room outside the lock that applied it.
 func (r *Room) applied(evs []Event) {
+	r.refreshPeers()
 	r.emit(evs...)
 	r.finishRemoval()
 	r.epochChanged()
@@ -428,12 +521,13 @@ func (r *Room) readEntry(l *roomLog, i uint64, b []byte, err error) (wait bool) 
 	key, ok := r.keys[epoch]
 	r.kmu.RUnlock()
 	if !ok {
-		if epoch > r.view.Load().epoch {
+		// A segment holds messages of its own epoch and of the ones before it: only those wait for the room to catch up.
+		if epoch <= l.epoch && epoch > r.view.Load().epoch {
 			return true
 		}
 		return fail(id, st.Device[:], epoch, ErrWrongEpoch)
 	}
-	ev, err := r.openStored(st, &key)
+	ev, err := r.openStored(st, l.epoch, &key)
 	if err != nil {
 		return fail(id, st.Device[:], epoch, err)
 	}
@@ -467,8 +561,8 @@ func (r *Room) reportGaps() {
 		if l.since.IsZero() {
 			l.since = now
 		}
-		if !l.reported && now.Sub(l.since) >= r.n.limits.CatchUpWait {
-			l.reported = true
+		if !l.gapReported && now.Sub(l.since) >= r.n.limits.CatchUpWait {
+			l.gapReported = true
 			gaps = append(gaps, fmt.Sprintf("a segment of device %x holds %d of %d entries", l.owner[:4], l.view.Len(), l.size))
 		}
 	}
@@ -631,6 +725,13 @@ func (r *Room) checkPins() {
 
 type pinConn struct{ cancel context.CancelFunc }
 
+// missing reports whether l is a replica that may lack entries: it is not a closed segment that holds its final size.
+func (r *Room) missing(l *roomLog) bool {
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
+	return l.rep != nil && !l.complete() && !(l.ctl && l.done)
+}
+
 // followPin pulls the room's logs from a pin on a connection until ctx ends, every PinWait: a pin offers a log to the
 // first peer that asks for it, so a watch of it that comes first learns nothing (see the library gaps of the roadmap).
 func (r *Room) followPin(ctx context.Context, p pin.Peer, c *pinConn) {
@@ -653,7 +754,7 @@ func (r *Room) followPin(ctx context.Context, p pin.Peer, c *pinConn) {
 	for dctx.Err() == nil {
 		grew := false
 		for _, l := range r.snapshot() {
-			if l.rep == nil || l.complete() {
+			if !r.missing(l) {
 				continue
 			}
 			before := l.rep.Len()

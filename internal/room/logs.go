@@ -45,7 +45,7 @@ type roomLog struct {
 	own     bool
 	ctl     bool
 	tree    bool   // holds the sealed tree of epoch
-	epoch   uint64 // of a segment or a tree
+	epoch   uint64 // of a segment, a tree or a control log
 	header  []byte
 	src     kolosync.Source
 	view    logView
@@ -53,15 +53,18 @@ type roomLog struct {
 	rep     *kolostore.Replica
 	deriver *kololog.KeyDeriver
 
-	closed   bool   // a segment whose writer declared its final size
-	size     uint64 // that size
-	cursor   uint64 // entries of a segment already read
-	keyed    uint64 // entries of a replica that have their keys
-	applied  uint64 // entries of a control log already applied
-	since    time.Time
-	reported bool
-	opened   bool   // a control log that has opened a segment
-	openedTo uint64 // the newest epoch it opened one for
+	closed      bool   // a segment whose writer declared its final size
+	size        uint64 // that size
+	cursor      uint64 // entries of a segment already read
+	keyed       uint64 // entries of a replica that have their keys
+	applied     uint64 // entries of a control log already applied
+	since       time.Time
+	keyReported bool   // a failure to derive or read its entries was reported
+	gapReported bool   // a closed segment that lacks entries was reported
+	opened      bool   // a control log that has opened a segment
+	openedTo    uint64 // the newest epoch it opened one for
+	done        bool   // a control log that its admin went on from in another log
+	past        bool   // a control log that History asked for
 }
 
 func (l *roomLog) key() logKey { return keyOf(l.owner, l.id) }
@@ -81,7 +84,7 @@ func (l *roomLog) close() {
 }
 
 func (l *roomLog) record() *logRec {
-	return &logRec{Ctl: l.ctl, Own: l.own, Tree: l.tree, Epoch: l.epoch, Closed: l.closed, Size: l.size, Cursor: l.cursor, Header: l.header}
+	return &logRec{Ctl: l.ctl, Own: l.own, Tree: l.tree, Epoch: l.epoch, Closed: l.closed, Size: l.size, Cursor: l.cursor, Header: l.header, Done: l.done}
 }
 
 // objRef is where a Commit or SettledCommit sits: an entry of a control log.
@@ -113,6 +116,22 @@ func (x *objIndex) put(key string, ref objRef) {
 		x.keys = slices.Insert(x.keys, i, key)
 	}
 	x.refs[key] = append(rs, ref)
+}
+
+// drop forgets the entries of the log l.
+func (x *objIndex) drop(l *roomLog) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	for k, rs := range x.refs {
+		if rs = slices.DeleteFunc(rs, func(o objRef) bool { return o.l == l }); len(rs) > 0 {
+			x.refs[k] = rs
+			continue
+		}
+		delete(x.refs, k)
+		if i, ok := slices.BinarySearch(x.keys, k); ok {
+			x.keys = slices.Delete(x.keys, i, i+1)
+		}
+	}
 }
 
 func (x *objIndex) all(key string) []objRef {
@@ -412,6 +431,9 @@ func (r *Room) forgetLocked(l *roomLog, deleteData bool) {
 	if deleteData {
 		r.n.cfg.Store.Delete(l.id)
 	}
+	if l.ctl {
+		r.idx.drop(l)
+	}
 	r.kv.del(recLog, l.owner[:], l.id[:])
 	delete(r.logs, l.key())
 }
@@ -447,14 +469,19 @@ func (r *Room) ensureCtl() error {
 // appendCtl writes records one after the other to this admin's control log, which no other write comes between, and applies
 // them to the index.
 func (r *Room) appendCtl(recs ...*ctlRecord) error {
+	r.ctlMu.Lock()
+	defer r.ctlMu.Unlock()
 	r.logMu.Lock()
 	l := r.ctl
 	r.logMu.Unlock()
 	if l == nil {
 		return ErrNotAdmin
 	}
-	r.ctlMu.Lock()
-	defer r.ctlMu.Unlock()
+	return r.appendLocked(l, recs...)
+}
+
+// appendLocked writes records to the control log l; r.ctlMu is held.
+func (r *Room) appendLocked(l *roomLog, recs ...*ctlRecord) error {
 	at := make([]uint64, len(recs))
 	for k, rec := range recs {
 		i, err := l.log.Append(rec.encode())
@@ -471,6 +498,42 @@ func (r *Room) appendCtl(recs ...*ctlRecord) error {
 	}
 	r.pinSoon(l)
 	return nil
+}
+
+// rotateCtl starts this admin's control log of epoch, so a joiner pulls only the logs of the epochs it reads: the old log
+// ends with a record that names the new one and the new one starts with a record that names the old one, which History
+// follows back.
+func (r *Room) rotateCtl(epoch uint64) error {
+	r.ctlMu.Lock()
+	defer r.ctlMu.Unlock()
+	r.logMu.Lock()
+	old := r.ctl
+	r.logMu.Unlock()
+	if old == nil || old.epoch >= epoch {
+		return nil
+	}
+	l, err := r.openLog(true, epoch, nil)
+	if err != nil {
+		return err
+	}
+	r.logMu.Lock()
+	err = r.trackLocked(l)
+	r.logMu.Unlock()
+	if err != nil {
+		l.close()
+		return err
+	}
+	if err := r.appendLocked(l, &ctlRecord{Kind: ctlPrev, Epoch: epoch, Header: old.header}); err != nil {
+		return err
+	}
+	if err := r.appendLocked(old, &ctlRecord{Kind: ctlNext, Epoch: epoch, Header: l.header}); err != nil {
+		return err
+	}
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
+	old.done, r.ctl = true, l
+	r.meta.Ctl, r.meta.HasCtl = l.id, true
+	return errors.Join(r.persistLogLocked(old), r.kv.put(r.meta.encode(), recMeta))
 }
 
 // indexRecord makes entry i of the control log l findable by the key of the object it starts, and reports whether it did.
@@ -568,9 +631,15 @@ func (r *Room) epochChanged() {
 func (r *Room) trimLocked() {
 	r.trimTreesLocked()
 	var replicas, own []*roomLog
+	epoch := r.view.Load().epoch
 	for _, l := range r.logs {
 		switch {
-		case l.ctl || r.isPast(l) || !l.complete() || r.dirtyLog(l):
+		// A replica of a control log goes once its admin went on from it, the room is past its epoch and it is read, unless
+		// History needs it. The admin keeps its own: a member that is behind pulls the Commits from it.
+		case l.ctl && (l.own || !l.done || l.epoch < r.joinEpoch || l.epoch >= epoch || l.applied < l.view.Len()) || r.dirtyLog(l):
+		case l.ctl:
+			replicas = append(replicas, l)
+		case r.isPast(l) || !l.complete():
 		case l.own:
 			own = append(own, l)
 		case l.cursor >= l.size:

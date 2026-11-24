@@ -139,8 +139,8 @@ func TestKeepSegmentsForgetsTheOldestReadOnes(t *testing.T) {
 		t.Fatalf("%d logs held", n)
 	}
 	// An admin forgets its own closed segments the same way, and keeps them in its store; it also keeps the tree log of the
-	// member it added.
-	waitFor(t, 30*time.Second, "the admin to trim", func() bool { return gr.rooms[0].Status().Logs <= 5 })
+	// member it added and its control logs of the room's two epochs.
+	waitFor(t, 30*time.Second, "the admin to trim", func() bool { return gr.rooms[0].Status().Logs <= 6 })
 	if !bodiesIn2(gr.recs[1], "m", 12) {
 		t.Fatal("a message was lost to the trim")
 	}
