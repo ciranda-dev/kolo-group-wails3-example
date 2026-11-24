@@ -121,44 +121,35 @@ func decodeContent(b []byte) (*content, error) {
 	return c, nil
 }
 
-// commitMsg carries a SettledCommit with its Commit, for the members to apply.
-type commitMsg struct {
-	Settled, Commit []byte
-}
+// commitRef announces a settled Commit: the SettledCommit, which names the Commit by its hash and carries the settlers'
+// signatures. The Commit itself is pulled from the control logs.
+type commitRef struct{ Settled []byte }
 
-func (c *commitMsg) encode() []byte {
+func (c *commitRef) encode() []byte {
 	var e kolocodec.Encoder
 	e.PutFixed([]byte{kindCommit})
-	e.PutBytes(c.Settled)
-	e.PutBytes(c.Commit)
+	e.PutFixed(c.Settled)
 	return e.Bytes()
 }
 
-func decodeCommit(b []byte) (*commitMsg, error) {
-	d := kolocodec.NewDecoder(b)
-	k, err := d.Fixed(1)
-	if err != nil || k[0] != kindCommit {
-		return nil, fmt.Errorf("%w: kind", ErrMalformed)
+func decodeCommitRef(b []byte) (*commitRef, error) {
+	if len(b) < 2 || b[0] != kindCommit {
+		return nil, fmt.Errorf("%w: commit announcement", ErrMalformed)
 	}
-	c := &commitMsg{}
-	if c.Settled, err = d.Bytes(d.Len()); err != nil {
-		return nil, fmt.Errorf("%w: settled commit", ErrMalformed)
-	}
-	if c.Commit, err = d.Bytes(d.Len()); err != nil {
-		return nil, fmt.Errorf("%w: commit", ErrMalformed)
-	}
-	if d.Len() != 0 || len(c.Settled) == 0 || len(c.Commit) == 0 {
-		return nil, fmt.Errorf("%w: commit message", ErrMalformed)
-	}
-	return c, nil
+	return &commitRef{Settled: b[1:]}, nil
 }
 
-// invite is what an admin hands a new member next to its Welcome: everything the joiner needs and the Welcome lacks.
+// invite is what an admin hands a new member next to its Welcome: everything the joiner needs and the Welcome lacks. The
+// sealed tree is not in it: the joiner pulls it from the log that TreeHeader names, which holds TreeEntries pieces of a
+// tree with hash TreeHash.
 type invite struct {
-	Welcome, Settled, Tree []byte
-	Secret                 [keySize]byte
-	Name                   string
-	Logs                   [][]byte // the headers of the admins' control logs
+	Welcome, Settled []byte
+	TreeHeader       []byte
+	TreeEntries      uint64
+	TreeHash         [32]byte
+	Secret           [keySize]byte
+	Name             string
+	Logs             [][]byte // the headers of the admins' control logs
 }
 
 const (
@@ -174,7 +165,9 @@ func (v *invite) encode() []byte {
 	e.PutUvarint(inviteVersion)
 	e.PutBytes(v.Welcome)
 	e.PutBytes(v.Settled)
-	e.PutBytes(v.Tree)
+	e.PutBytes(v.TreeHeader)
+	e.PutUvarint(v.TreeEntries)
+	e.PutFixed(v.TreeHash[:])
 	e.PutFixed(v.Secret[:])
 	e.PutString(v.Name)
 	e.PutUvarint(uint64(len(v.Logs)))
@@ -184,7 +177,7 @@ func (v *invite) encode() []byte {
 	return e.Bytes()
 }
 
-// decodeInvite reads an invite whose tree is at most maxTree bytes.
+// decodeInvite reads an invite whose sealed tree is at most maxTree bytes, which bounds the pieces it names.
 func decodeInvite(b []byte, maxTree int) (*invite, error) {
 	d := kolocodec.NewDecoder(b)
 	if ver, err := d.Uvarint(); err != nil || ver != inviteVersion {
@@ -198,9 +191,17 @@ func decodeInvite(b []byte, maxTree int) (*invite, error) {
 	if v.Settled, err = d.Bytes(maxSettled); err != nil {
 		return nil, fmt.Errorf("%w: settled commit", ErrMalformed)
 	}
-	if v.Tree, err = d.Bytes(maxTree + 64); err != nil {
-		return nil, fmt.Errorf("%w: tree", ErrMalformed)
+	if v.TreeHeader, err = d.Bytes(maxHeader); err != nil {
+		return nil, fmt.Errorf("%w: tree log", ErrMalformed)
 	}
+	if v.TreeEntries, err = d.Uvarint(); err != nil || v.TreeEntries > uint64(maxTree/maxChunk)+2 {
+		return nil, fmt.Errorf("%w: tree pieces", ErrMalformed)
+	}
+	h, err := d.Fixed(32)
+	if err != nil {
+		return nil, fmt.Errorf("%w: tree hash", ErrMalformed)
+	}
+	copy(v.TreeHash[:], h)
 	s, err := d.Fixed(keySize)
 	if err != nil {
 		return nil, fmt.Errorf("%w: secret", ErrMalformed)
@@ -269,17 +270,24 @@ const (
 	ctlDir   byte = 4 // the control log of another admin
 	ctlLink  byte = 5 // the history link of an epoch
 	ctlRead  byte = 6 // the state of an epoch sealed under the room's read secret, for the readers of a read link
+	ctlChunk byte = 7 // a piece of a Commit or of a sealed tree, under the hash of the whole
+	ctlTree  byte = 8 // the log that holds the sealed tree of an epoch
 )
+
+// maxChunk is the most bytes of one piece: kolo-sync answers a request for entries with about 1 MiB, so a piece fits one answer.
+const maxChunk = 1 << 20
 
 // ctlRecord is one entry of an admin's control log.
 type ctlRecord struct {
 	Kind   byte
-	Key    string // ctlPut
-	Value  []byte // ctlPut, ctlLink, ctlRead
-	Epoch  uint64 // ctlOpen, ctlLink, ctlRead
-	Header []byte // ctlOpen, ctlDir: the signed log header, so a reader opens the replica without asking anyone
-	ID     [32]byte
-	Size   uint64 // ctlClose
+	Key    string   // ctlPut
+	Value  []byte   // ctlPut, ctlLink, ctlRead
+	Epoch  uint64   // ctlOpen, ctlLink, ctlRead
+	Header []byte   // ctlOpen, ctlDir, ctlTree: the signed log header, so a reader opens the replica without asking anyone
+	ID     [32]byte // ctlClose: the log; ctlChunk: the hash of the whole
+	Size   uint64   // ctlClose
+	Index  uint64   // ctlChunk: this piece, of Count
+	Count  uint64
 }
 
 func (c *ctlRecord) encode() []byte {
@@ -303,6 +311,14 @@ func (c *ctlRecord) encode() []byte {
 	case ctlRead:
 		e.PutUvarint(c.Epoch)
 		e.PutBytes(c.Value)
+	case ctlChunk:
+		e.PutFixed(c.ID[:])
+		e.PutUvarint(c.Index)
+		e.PutUvarint(c.Count)
+		e.PutBytes(c.Value)
+	case ctlTree:
+		e.PutUvarint(c.Epoch)
+		e.PutBytes(c.Header)
 	}
 	return e.Bytes()
 }
@@ -339,6 +355,23 @@ func decodeCtl(b []byte, maxValue int) (*ctlRecord, error) {
 	case ctlRead:
 		if c.Epoch, err = d.Uvarint(); err == nil {
 			c.Value, err = d.Bytes(maxValue)
+		}
+	case ctlChunk:
+		var id []byte
+		if id, err = d.Fixed(32); err == nil {
+			copy(c.ID[:], id)
+			if c.Index, err = d.Uvarint(); err == nil {
+				if c.Count, err = d.Uvarint(); err == nil {
+					c.Value, err = d.Bytes(maxChunk)
+				}
+			}
+		}
+		if err == nil && (c.Count == 0 || c.Index >= c.Count || len(c.Value) == 0) {
+			err = errors.New("piece out of range")
+		}
+	case ctlTree:
+		if c.Epoch, err = d.Uvarint(); err == nil {
+			c.Header, err = d.Bytes(maxHeader)
 		}
 	default:
 		err = errors.New("unknown kind")
@@ -426,4 +459,14 @@ func decodeAdminOffer(b []byte) (*adminOffer, error) {
 		return nil, fmt.Errorf("%w: trailing bytes", ErrMalformed)
 	}
 	return o, nil
+}
+
+// pieces cuts b, the object with hash h, into the control records that carry it.
+func pieces(h [32]byte, b []byte) []*ctlRecord {
+	n := (len(b) + maxChunk - 1) / maxChunk
+	out := make([]*ctlRecord, n)
+	for i := range out {
+		out[i] = &ctlRecord{Kind: ctlChunk, ID: h, Index: uint64(i), Count: uint64(n), Value: b[i*maxChunk : min(len(b), (i+1)*maxChunk)]}
+	}
+	return out
 }

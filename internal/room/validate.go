@@ -90,7 +90,7 @@ func (r *Room) check(m *kologossip.Message) error {
 		_, err = r.openMessage(&key, s, m)
 		return err
 	case kindCommit:
-		c, err := decodeCommit(m.Body)
+		c, err := decodeCommitRef(m.Body)
 		if err != nil {
 			return err
 		}
@@ -103,6 +103,9 @@ func (r *Room) check(m *kologossip.Message) error {
 		}
 		if string(st.TBS.GroupID) != string(r.gid[:]) || st.TBS.Epoch != v.epoch {
 			return ErrWrongEpoch
+		}
+		if st.Valid(v.roles, func(d [32]byte) bool { return v.author(d) != nil }) < v.roles.Q() {
+			return ErrCommitRef
 		}
 		if !r.rate.allow([32]byte(m.Device), now) {
 			return ErrRate

@@ -68,10 +68,10 @@ func (r *Room) followEvents() {
 			return
 		}
 		switch ev.Kind {
-		case kolosync.Grew:
+		case kolosync.FollowGrew:
 			r.moved()
 			r.kick()
-		case kolosync.Diverged:
+		case kolosync.FollowDiverged:
 			r.emit(Event{Kind: CatchingUp, Err: fmt.Errorf("%w: a log of device %x holds two histories: %w", ErrCatchUp, ev.Owner[:4], ev.Err)})
 		}
 	}
@@ -100,7 +100,7 @@ func (r *Room) syncOnce() {
 	}
 	r.advance()
 	for _, l := range r.snapshot() {
-		if !l.ctl && !r.isPast(l) {
+		if !l.ctl && !l.tree && !r.isPast(l) {
 			r.scanSegment(l)
 		}
 	}
@@ -178,9 +178,8 @@ func (r *Room) reportOnce(l *roomLog, err error) {
 func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 	v := r.view.Load()
 	switch rec.Kind {
-	case ctlPut:
-		if shared(rec.Key) {
-			r.idx.put(rec.Key, objRef{l, i})
+	case ctlPut, ctlChunk:
+		if r.indexRecord(l, i, rec) {
 			r.poke()
 		}
 	case ctlOpen:
@@ -195,6 +194,8 @@ func (r *Room) applyCtl(l *roomLog, i uint64, rec *ctlRecord) bool {
 			return false
 		}
 		return r.addLog(l.owner, rec.Header, false, rec.Epoch)
+	case ctlTree:
+		r.followTree(l, rec)
 	case ctlLink:
 		r.addLink(l, rec)
 	case ctlRead:
@@ -290,9 +291,17 @@ func (r *Room) advanceOnce() bool {
 	r.mu.Unlock()
 	key := settle.SettledKey(r.gid[:], e)
 	shares := len(r.view.Load().roles.Settlers)
+	var cands [][]byte
+	if h := r.hint.Load(); h != nil && h.epoch == e {
+		cands = append(cands, h.settled)
+	}
 	for _, ref := range r.idx.all(key) {
-		sb, err := r.readObject(ref, key)
-		if err != nil || len(sb) > settledBound(shares) {
+		if sb, err := r.readObject(ref, key); err == nil {
+			cands = append(cands, sb)
+		}
+	}
+	for _, sb := range cands {
+		if len(sb) > settledBound(shares) {
 			continue
 		}
 		st, err := settle.DecodeSettled(sb, shares)
@@ -324,7 +333,9 @@ func (r *Room) advanceOnce() bool {
 		r.mu.Unlock()
 		r.moved()
 		r.applied(evs)
-		r.emit(Event{Kind: CatchingUp, Epoch: e + 1})
+		if !r.removed.Load() {
+			r.emit(Event{Kind: CatchingUp, Epoch: e + 1})
+		}
 		return true
 	}
 	return false
@@ -554,7 +565,7 @@ func (r *Room) loadReceipts() error {
 func (r *Room) catchingUp() bool {
 	for _, l := range r.snapshot() {
 		r.logMu.Lock()
-		behind := !l.ctl && !r.isPast(l) && l.cursor < l.view.Len() || l.closed && !l.complete()
+		behind := !l.ctl && !l.tree && !r.isPast(l) && l.cursor < l.view.Len() || l.closed && !l.complete()
 		r.logMu.Unlock()
 		if behind {
 			return true

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,7 +44,8 @@ type roomLog struct {
 	id      kololog.LogID
 	own     bool
 	ctl     bool
-	epoch   uint64 // of a segment
+	tree    bool   // holds the sealed tree of epoch
+	epoch   uint64 // of a segment or a tree
 	header  []byte
 	src     kolosync.Source
 	view    logView
@@ -78,7 +81,7 @@ func (l *roomLog) close() {
 }
 
 func (l *roomLog) record() *logRec {
-	return &logRec{Ctl: l.ctl, Own: l.own, Epoch: l.epoch, Closed: l.closed, Size: l.size, Cursor: l.cursor, Header: l.header}
+	return &logRec{Ctl: l.ctl, Own: l.own, Tree: l.tree, Epoch: l.epoch, Closed: l.closed, Size: l.size, Cursor: l.cursor, Header: l.header}
 }
 
 // objRef is where a Commit or SettledCommit sits: an entry of a control log.
@@ -148,9 +151,16 @@ const (
 	settledPrefix = "kolo-mls/settled/"
 )
 
+func isObject(key string) bool  { return strings.HasPrefix(key, objectPrefix) }
+func isSettled(key string) bool { return strings.HasPrefix(key, settledPrefix) }
+
 // shared reports whether a key of settle.Pins goes to the control log, for every member to read.
-func shared(key string) bool {
-	return strings.HasPrefix(key, objectPrefix) || strings.HasPrefix(key, settledPrefix)
+func shared(key string) bool { return isObject(key) || isSettled(key) }
+
+// objectHash returns the hash an object key names.
+func objectHash(key string) ([32]byte, bool) {
+	b, err := hex.DecodeString(strings.TrimPrefix(key, objectPrefix))
+	return [32]byte(b), err == nil && len(b) == 32
 }
 
 // roomPins is settle.Pins over the control logs: a Commit and a SettledCommit go to this admin's control log and are read
@@ -158,7 +168,10 @@ func shared(key string) bool {
 type roomPins struct{ r *Room }
 
 func (p roomPins) Put(_ context.Context, key string, value []byte) error {
-	if !shared(key) {
+	switch {
+	case isObject(key):
+		return p.r.putObject(key, value)
+	case !isSettled(key):
 		return p.r.kv.put(value, recObject, []byte(key))
 	}
 	for _, ref := range p.r.idx.all(key) {
@@ -169,26 +182,66 @@ func (p roomPins) Put(_ context.Context, key string, value []byte) error {
 	return p.r.appendCtl(&ctlRecord{Kind: ctlPut, Key: key, Value: value})
 }
 
+// putObject writes a Commit to this admin's control log in pieces, under the hash its key names.
+func (r *Room) putObject(key string, value []byte) error {
+	h, ok := objectHash(key)
+	if !ok || len(value) == 0 || sha256.Sum256(value) != h {
+		return errInvalid("an object that does not match its key")
+	}
+	for _, ref := range r.idx.all(key) {
+		if v, err := readPieces(ref.l.view, ref.i, h, 0); ref.l.own && err == nil && bytes.Equal(v, value) {
+			return nil
+		}
+	}
+	return r.appendCtl(pieces(h, value)...)
+}
+
+// readPieces reads the object with hash h whose first piece is entry first of v, at most max bytes (0 is no bound). It
+// fails until every piece has arrived, and when what the pieces hold does not hash to h.
+func readPieces(v logView, first uint64, h [32]byte, max int) ([]byte, error) {
+	var out []byte
+	for i := uint64(0); ; i++ {
+		b, err := v.Get(first + i)
+		if err != nil {
+			return nil, fmt.Errorf("%w: piece %d: %w", settle.ErrMissing, i, err)
+		}
+		rec, err := decodeCtl(b, 0)
+		if err != nil || rec.Kind != ctlChunk || rec.ID != h || rec.Index != i {
+			return nil, fmt.Errorf("%w: piece %d", settle.ErrMissing, i)
+		}
+		if out = append(out, rec.Value...); max > 0 && len(out) > max {
+			return nil, settle.ErrPinTooLarge
+		}
+		if i+1 == rec.Count {
+			break
+		}
+	}
+	if sha256.Sum256(out) != h {
+		return nil, fmt.Errorf("%w: pieces do not match their hash", settle.ErrMissing)
+	}
+	return out, nil
+}
+
 func (p roomPins) Get(_ context.Context, key string, max int) ([]byte, error) {
 	var v []byte
-	if shared(key) {
+	switch {
+	case isObject(key):
+		return p.r.getObject(key, max)
+	case isSettled(key):
 		refs := p.r.idx.all(key)
 		if len(refs) == 0 {
 			return nil, fmt.Errorf("%w: %s", settle.ErrMissing, key)
 		}
-		// A Commit is named by its hash, so the first value that matches it is the one; the other keys have one writer's
-		// value each, and the caller that can check them goes through the candidates itself.
+		// Each admin has one value for the key, and the caller that can check them goes through the candidates itself.
 		for _, ref := range refs {
-			val, err := p.r.readObject(ref, key)
-			if err == nil && matchesKey(key, val) {
-				v = val
+			if v, _ = p.r.readObject(ref, key); v != nil {
 				break
 			}
 		}
 		if v == nil {
 			return nil, fmt.Errorf("%w: %s", settle.ErrMissing, key)
 		}
-	} else {
+	default:
 		var err error
 		if v, err = p.r.kv.get(recObject, []byte(key)); err != nil {
 			return nil, err
@@ -215,13 +268,25 @@ func (r *Room) readObject(ref objRef, key string) ([]byte, error) {
 	return rec.Value, nil
 }
 
-// matchesKey reports whether a value is the one its key names: a Commit has the hash in its key.
-func matchesKey(key string, v []byte) bool {
-	if !strings.HasPrefix(key, objectPrefix) {
-		return true
+// getObject returns the Commit a key names from the first control log whose pieces are all there and hash right: a log that
+// is cut short or serves other bytes is passed over for another admin's.
+func (r *Room) getObject(key string, max int) ([]byte, error) {
+	h, ok := objectHash(key)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", settle.ErrMissing, key)
 	}
-	h := sha256.Sum256(v)
-	return key == settle.ObjectKey(h)
+	tooLarge := false
+	for _, ref := range r.idx.all(key) {
+		v, err := readPieces(ref.l.view, ref.i, h, max)
+		if err == nil {
+			return v, nil
+		}
+		tooLarge = tooLarge || errors.Is(err, settle.ErrPinTooLarge)
+	}
+	if tooLarge {
+		return nil, settle.ErrPinTooLarge
+	}
+	return nil, fmt.Errorf("%w: %s", settle.ErrMissing, key)
 }
 
 func (p roomPins) List(_ context.Context, prefix, after string, max int) ([]string, error) {
@@ -245,7 +310,21 @@ func (p roomPins) Delete(_ context.Context, key string) error {
 	if shared(key) {
 		return nil
 	}
+	if epoch, ok := treeEpoch(key, p.r.gid); ok {
+		p.r.dropTreeLog(epoch)
+	}
 	return p.r.kv.del(recObject, []byte(key))
+}
+
+// treeEpoch returns the epoch a tree key of this room names.
+func treeEpoch(key string, gid GroupID) (uint64, bool) {
+	prefix := settle.TreeKey(gid[:], 0)
+	rest, ok := strings.CutPrefix(key, prefix[:len(prefix)-1])
+	if !ok {
+		return 0, false
+	}
+	e, err := strconv.ParseUint(rest, 10, 64)
+	return e, err == nil
 }
 
 // openLog creates or opens this device's own log, with the room's derived entry keys.
@@ -268,6 +347,10 @@ func (r *Room) openLog(ctl bool, epoch uint64, id *kololog.LogID) (*roomLog, err
 
 // replicate opens the replica of an admin's log from its signed header and has it followed.
 func (r *Room) replicate(owner [32]byte, header []byte, ctl bool, epoch uint64) (*roomLog, error) {
+	return r.replicateKind(owner, header, ctl, false, epoch)
+}
+
+func (r *Room) replicateKind(owner [32]byte, header []byte, ctl, tree bool, epoch uint64) (*roomLog, error) {
 	hd, err := kololog.DecodeLogHeader(header)
 	if err != nil || !bytes.Equal(hd.LogKey, owner[:]) {
 		return nil, fmt.Errorf("%w: log header", ErrMalformed)
@@ -289,7 +372,7 @@ func (r *Room) replicate(owner [32]byte, header []byte, ctl bool, epoch uint64) 
 		rep.Close()
 		return nil, err
 	}
-	l := &roomLog{owner: owner, id: hd.LogID, ctl: ctl, epoch: epoch, header: header, src: rep, view: rep, rep: rep, deriver: d}
+	l := &roomLog{owner: owner, id: hd.LogID, ctl: ctl, tree: tree, epoch: epoch, header: header, src: rep, view: rep, rep: rep, deriver: d}
 	if err := r.trackLocked(l); err != nil {
 		l.close()
 		return nil, err
@@ -361,8 +444,9 @@ func (r *Room) ensureCtl() error {
 	return nil
 }
 
-// appendCtl writes a record to this admin's control log and applies it to the index.
-func (r *Room) appendCtl(rec *ctlRecord) error {
+// appendCtl writes records one after the other to this admin's control log, which no other write comes between, and applies
+// them to the index.
+func (r *Room) appendCtl(recs ...*ctlRecord) error {
 	r.logMu.Lock()
 	l := r.ctl
 	r.logMu.Unlock()
@@ -371,18 +455,35 @@ func (r *Room) appendCtl(rec *ctlRecord) error {
 	}
 	r.ctlMu.Lock()
 	defer r.ctlMu.Unlock()
-	i, err := l.log.Append(rec.encode())
-	if err != nil {
-		return err
+	at := make([]uint64, len(recs))
+	for k, rec := range recs {
+		i, err := l.log.Append(rec.encode())
+		if err != nil {
+			return err
+		}
+		at[k] = i
 	}
 	r.logMu.Lock()
-	l.applied = i + 1
+	l.applied = at[len(at)-1] + 1
 	r.logMu.Unlock()
-	if rec.Kind == ctlPut && shared(rec.Key) {
-		r.idx.put(rec.Key, objRef{l, i})
+	for k, rec := range recs {
+		r.indexRecord(l, at[k], rec)
 	}
 	r.pinSoon(l)
 	return nil
+}
+
+// indexRecord makes entry i of the control log l findable by the key of the object it starts, and reports whether it did.
+func (r *Room) indexRecord(l *roomLog, i uint64, rec *ctlRecord) bool {
+	switch {
+	case rec.Kind == ctlPut && isSettled(rec.Key):
+		r.idx.put(rec.Key, objRef{l, i})
+	case rec.Kind == ctlChunk && rec.Index == 0:
+		r.idx.put(settle.ObjectKey(rec.ID), objRef{l, i})
+	default:
+		return false
+	}
+	return true
 }
 
 // archive stores a message in this admin's current segment; a device that is no admin keeps none.
@@ -465,6 +566,7 @@ func (r *Room) epochChanged() {
 // replica is deleted from the store: the pins and the other members hold the log. An admin's own segment stays in the store
 // and is only closed, since it may be the only copy.
 func (r *Room) trimLocked() {
+	r.trimTreesLocked()
 	var replicas, own []*roomLog
 	for _, l := range r.logs {
 		switch {
@@ -512,4 +614,75 @@ func (l *roomLog) deriveKeys() error {
 		l.keyed = end
 	}
 	return nil
+}
+
+// writeTree puts the sealed tree of epoch into a log of this admin, in pieces under its hash, and names the log in the
+// control log, so the members that hold it can serve it to a joiner. It returns the log's header and entry count.
+func (r *Room) writeTree(epoch uint64, sealed []byte) (header []byte, entries uint64, err error) {
+	h := sha256.Sum256(sealed)
+	ps := pieces(h, sealed)
+	r.logMu.Lock()
+	for _, l := range r.logs {
+		if l.tree && l.own && l.epoch == epoch && l.log.Len() == uint64(len(ps)) {
+			r.logMu.Unlock()
+			return l.header, l.log.Len(), nil
+		}
+	}
+	l, err := r.openLog(false, epoch, nil)
+	if err == nil {
+		l.tree = true
+		if err = r.trackLocked(l); err != nil {
+			l.close()
+		}
+	}
+	r.logMu.Unlock()
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, p := range ps {
+		if _, err := l.log.Append(p.encode()); err != nil {
+			return nil, 0, err
+		}
+	}
+	if err := r.appendCtl(&ctlRecord{Kind: ctlTree, Epoch: epoch, Header: l.header}); err != nil {
+		return nil, 0, err
+	}
+	r.pinSoon(l)
+	return l.header, l.log.Len(), nil
+}
+
+// dropTreeLog forgets this admin's log of the tree of epoch: no joiner needs it any more.
+func (r *Room) dropTreeLog(epoch uint64) {
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
+	for _, l := range r.logs {
+		if l.tree && l.own && l.epoch == epoch && !r.dirtyLog(l) {
+			r.forgetLocked(l, true)
+		}
+	}
+}
+
+// followTree replicates the log of the sealed tree that an admin named, unless the room is past its epoch: only a joiner of
+// that epoch reads it, and a device that holds it can serve it.
+func (r *Room) followTree(l *roomLog, rec *ctlRecord) {
+	if rec.Epoch < r.view.Load().epoch {
+		return
+	}
+	hd, err := kololog.DecodeLogHeader(rec.Header)
+	if err != nil || !bytes.Equal(hd.LogKey, l.owner[:]) {
+		return
+	}
+	if _, err := r.replicateKind(l.owner, rec.Header, false, true, rec.Epoch); err != nil && r.ctx.Err() == nil {
+		r.emit(Event{Kind: CatchingUp, Err: fmt.Errorf("%w: %w", ErrCatchUp, err)})
+	}
+}
+
+// trimTreesLocked forgets the replicas of trees that the room is past.
+func (r *Room) trimTreesLocked() {
+	epoch := r.view.Load().epoch
+	for _, l := range r.logs {
+		if l.tree && !l.own && l.epoch < epoch {
+			r.forgetLocked(l, true)
+		}
+	}
 }

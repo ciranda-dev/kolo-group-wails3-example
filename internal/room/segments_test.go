@@ -119,8 +119,7 @@ func TestMemberAwayCatchesUpFromTheAdmin(t *testing.T) {
 			t.Fatalf("an event with an error: %+v", ev)
 		}
 	}
-	a0, _ := gr.rooms[0].m.EpochAuthenticator()
-	a2, _ := r.m.EpochAuthenticator()
+	a0, a2 := authenticatorOf(gr.rooms[0]), authenticatorOf(r)
 	if string(a0) != string(a2) {
 		t.Fatal("another epoch authenticator")
 	}
@@ -397,11 +396,11 @@ func TestRestartOverPebbleStores(t *testing.T) {
 		}
 	}
 	waitFor(t, 30*time.Second, "the admin's segment", func() bool { return segLen(gr.rooms[0]) == 5 })
-	want, _ := gr.rooms[0].m.EpochAuthenticator()
+	want := authenticatorOf(gr.rooms[0])
 	seg := gr.rooms[0].seg.id
 	gr.stop(0)
 	r := gr.restart(0)
-	got, _ := r.m.EpochAuthenticator()
+	got := authenticatorOf(r)
 	if string(got) != string(want) || r.seg == nil || r.seg.id != seg || segLen(r) != 5 || !r.isAdmin() {
 		t.Fatal("the admin did not reopen as it was")
 	}

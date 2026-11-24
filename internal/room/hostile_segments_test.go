@@ -93,7 +93,7 @@ func TestHostileSegmentEntriesAreReportedNotSkipped(t *testing.T) {
 		}
 	}
 	for _, l := range reader.snapshot() {
-		if !l.ctl && l.cursor != l.view.Len() {
+		if !l.ctl && !l.tree && l.cursor != l.view.Len() {
 			t.Fatalf("a segment is read to %d of %d: an entry was left unread", l.cursor, l.view.Len())
 		}
 	}

@@ -208,8 +208,8 @@ func TestPolicyOfEachEpochSurvivesARestart(t *testing.T) {
 	}
 }
 
-// A policy whose Commit does not fit one gossip message is refused before it is made, and the room goes on.
-func TestSetPolicyRefusesAPolicyThatDoesNotFit(t *testing.T) {
+// A policy whose Commit is far past one gossip message still reaches the members, by reference.
+func TestSetPolicyWithACommitPastOneGossipMessage(t *testing.T) {
 	gr := newGroupWith(t, 2, Limits{MaxMessageSize: 64 << 10}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -220,13 +220,13 @@ func TestSetPolicyRefusesAPolicyThatDoesNotFit(t *testing.T) {
 		posters = append(posters, k)
 	}
 	e := gr.rooms[0].Status().Epoch
-	if err := gr.rooms[0].SetPolicy(ctx, Policy{Posters: posters}); !errors.Is(err, ErrTooLarge) {
+	if err := gr.rooms[0].SetPolicy(ctx, Policy{Posters: posters}); err != nil {
 		t.Fatalf("SetPolicy: %v", err)
 	}
-	if err := gr.rooms[0].SetPolicy(ctx, Policy{AdminsPost: true}); err != nil {
-		t.Fatalf("the room does not go on: %v", err)
-	}
 	gr.waitEpoch(e + 1)
+	if got := len(gr.rooms[1].view.Load().pol.persons); got != 3000 {
+		t.Fatalf("the member holds %d posters", got)
+	}
 }
 
 // A history rule set by a Commit holds from the next epoch: epochs that had no links stay closed, and a joiner reads back

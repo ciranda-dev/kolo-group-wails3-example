@@ -21,6 +21,8 @@ var (
 	ErrOpen            = errors.New("room: message does not open")
 	ErrRate            = errors.New("room: sender over its rate")
 	ErrTooLarge        = errors.New("room: message too large")
+	ErrTree            = errors.New("room: sealed tree refused")
+	ErrCommitRef       = errors.New("room: commit announcement without a quorum of settler signatures")
 	ErrTooManyParents  = errors.New("room: too many parents")
 	ErrBadTime         = errors.New("room: message time out of range")
 	ErrSignature       = errors.New("room: author signature does not verify")

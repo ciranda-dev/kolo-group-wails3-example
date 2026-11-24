@@ -74,6 +74,7 @@ const (
 	recAuthor  = "a/"
 	recReceipt = "x/"
 	recObject  = "t/"
+	recWelcome = "w/" // a device whose Welcome this admin made and that has not made contact
 )
 
 const metaVersion = 0
@@ -151,6 +152,7 @@ func decodeMeta(b []byte) (*meta, error) {
 type logRec struct {
 	Ctl    bool
 	Own    bool
+	Tree   bool // the log holds the sealed tree of Epoch
 	Epoch  uint64
 	Closed bool
 	Size   uint64
@@ -161,7 +163,7 @@ type logRec struct {
 func (l *logRec) encode() []byte {
 	var e kolocodec.Encoder
 	flags := byte(0)
-	for i, f := range []bool{l.Ctl, l.Own, l.Closed} {
+	for i, f := range []bool{l.Ctl, l.Own, l.Closed, l.Tree} {
 		if f {
 			flags |= 1 << i
 		}
@@ -180,10 +182,10 @@ func decodeLogRec(b []byte) (*logRec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: log record", ErrMalformed)
 	}
-	if f[0]&^0x7 != 0 {
+	if f[0]&^0xf != 0 {
 		return nil, fmt.Errorf("%w: log record flags", ErrMalformed)
 	}
-	l := &logRec{Ctl: f[0]&1 != 0, Own: f[0]&2 != 0, Closed: f[0]&4 != 0}
+	l := &logRec{Ctl: f[0]&1 != 0, Own: f[0]&2 != 0, Closed: f[0]&4 != 0, Tree: f[0]&8 != 0}
 	if l.Epoch, err = d.Uvarint(); err == nil {
 		if l.Size, err = d.Uvarint(); err == nil {
 			if l.Cursor, err = d.Uvarint(); err == nil {
