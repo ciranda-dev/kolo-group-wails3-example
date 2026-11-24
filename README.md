@@ -8,7 +8,7 @@
 
 <p align="center"><a href="CHANGELOG.md"><img src="https://img.shields.io/badge/status-experimental-red" alt="status: experimental"></a> <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license: Apache-2.0"></a> <a href="go.mod"><img src="https://img.shields.io/badge/go-1.26%2B-00ADD8" alt="go: 1.26+"></a> <a href="go.mod"><img src="https://img.shields.io/badge/wails-3-DF0000" alt="wails: 3"></a> <a href="#platforms"><img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey" alt="platforms: macOS | Windows | Linux"></a></p>
 
-This repository is private and experimental. It builds only inside the Kolo workspace (a folder with a `go.work` file that lists the `kolo-*` checkouts), because `kolo-mls` and `kolo-gossip` have no release yet.
+This example is experimental. It builds against the released libraries, `kolo-mls` and `kolo-gossip` v0.1.0 among them, so use `GOWORK=off` when this folder sits inside a Go workspace.
 
 ## What it does
 
@@ -24,15 +24,15 @@ This repository is private and experimental. It builds only inside the Kolo work
 
 | Platform | Install | Version | Status |
 |---|---|---|---|
-| macOS (universal) | `.dmg` or `.zip` | none | Not released yet |
-| Windows (amd64, arm64) | installer `.exe`, `.exe` or `.zip` | none | Not released yet |
-| Linux (amd64, arm64) | `.deb` or `.tar.gz` | none | Not released yet |
+| macOS (universal) | `.dmg` or `.zip` | v0.1.0 | Beta, unsigned |
+| Windows (amd64, arm64) | installer `.exe`, `.exe` or `.zip` | v0.1.0 | Beta, unsigned |
+| Linux (amd64, arm64) | `.deb` or `.tar.gz` | v0.1.0 | Beta, unsigned |
 
-There is no release yet. Build your own with `scripts/release-local.sh` (see [build and test](docs/build-and-test.md)).
+Get the files from the [latest release](https://github.com/ciranda-dev/kolo-group-wails3-example/releases), with `SHA256SUMS` to check them. They are not signed or notarized, so the system warns before the first run. Build your own with `scripts/release-local.sh` (see [build and test](docs/build-and-test.md)).
 
 ## Run it
 
-You need Go 1.26.0 or later, Node.js with npm, and the Wails 3 CLI (`go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0`). Run the commands in this folder while it sits in the Kolo workspace.
+You need Go 1.26.0 or later, Node.js with npm, and the Wails 3 CLI (`go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0`). The repository has no `go.work` and no `replace`, so use `GOWORK=off` when this folder sits inside a Go workspace.
 
 ```sh
 wails3 generate bindings -clean=true -time-type=Date
@@ -40,7 +40,7 @@ wails3 generate bindings -clean=true -time-type=Date
 go build -tags production -o bin/kolo-group .
 ```
 
-`wails3 build` runs `go mod tidy`, which cannot find kolo-mls and kolo-gossip until they have a release, so these three commands are the steps it runs, without that one. Tests: `go test -p 2 ./...` and `(cd frontend && npm test)`. Live reload: `KOLO_GROUP_DATA="$(mktemp -d)" wails3 dev`.
+These three commands are the steps `wails3 build` runs. Tests: `GOWORK=off go test -p 2 ./...` and `(cd frontend && npm test)`. Live reload: `KOLO_GROUP_DATA="$(mktemp -d)" wails3 dev`.
 
 ### Quick start on one computer
 
