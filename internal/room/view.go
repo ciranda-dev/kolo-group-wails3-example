@@ -18,6 +18,7 @@ type view struct {
 	authors map[[32]byte]*kologossip.Author
 	members []Member
 	roles   *settle.Roles
+	hist    histPolicy
 	// prev is the epoch before, kept until prevUntil so messages in flight still pass.
 	prev      *view
 	prevUntil time.Time
@@ -29,11 +30,15 @@ func newView(m *settle.Member, old *view, now time.Time, window time.Duration) (
 	if err != nil {
 		return nil, err
 	}
+	hist, err := policyOf(m.Extensions())
+	if err != nil {
+		return nil, err
+	}
 	key, err := epochKey(m.Export, m.GroupID(), m.Epoch())
 	if err != nil {
 		return nil, err
 	}
-	v := &view{epoch: m.Epoch(), key: key, roles: roles, authors: map[[32]byte]*kologossip.Author{}}
+	v := &view{epoch: m.Epoch(), key: key, roles: roles, hist: hist, authors: map[[32]byte]*kologossip.Author{}}
 	t := m.Tree()
 	for _, l := range t.Members() {
 		c, err := cred.Decode(t.Leaf(l).Credential)

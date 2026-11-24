@@ -66,13 +66,29 @@ One run on a laptop under a load of 10 to 13, 127.0.0.1, all connections real, t
 | 64 devices, 2 admins, 2 pins; 3 members away through 3 epochs and 10,000 messages from 8 devices, an admin killed in the middle of an epoch and started again | 61 devices joined in 7 s; the 10,000 messages were sent in 1 m 43 s and every one was stored; a member away read 3 epochs and all 10,000 messages in 1.3 s with the admins present, in 7.7 s with every other member away (from the pins only) and in 19.7 s with the pins down (the stopped pins still accept a connection and never answer, so the device waits for two pulls of 2 `PinWait` each before the peers serve it) |
 | 16 devices, 800 messages, the same three recoveries | 0.27 s, 5.3 s and 2.1 s |
 
+## History
+
+History adds no field to `room.Limits`. Its waits are `CatchUpWait` (the longest `History` waits for a link, for the control logs and for the segments of one epoch) and `PinWait` (when a device asks the pins), and `MaxLogs` bounds the segments of one epoch that `History` follows at once. `History` follows the segments of one epoch, reads them and forgets them, so a read of any depth keeps one epoch in memory, with the page it has not returned yet. What grows with the room, derived from the admins' control logs that a member follows anyway: one link of 72 bytes held in memory for each epoch before the join and each admin that wrote it, and a few bytes for each segment of those epochs. A hostile admin can make these grow only by writing records to its own log, as it can with the index of Commits.
+
+| What | Measured | How |
+|---|---|---|
+| a link | 72 bytes of data, 76 bytes as a control record | the nonce, the sealed key and its tag |
+| a link on disk | 930 bytes (1,000 links) to 1,170 bytes (10,000 links) in a Pebble log | one run, `TestMeasureLinks` (`KOLO_GROUP_MEASURE=1`); the kolo-log entry, its signature and the store's own records account for the rest |
+| the walk of a chain | 2 microseconds a link on Pebble with all keys written in one batch (12 ms for 1,000, 21 ms for 10,000, 167 ms for 100,000) | the same test, a room of 3 devices; opening a link takes 1 microsecond |
+| the links in memory | 150 to 174 bytes each (116 at 1,000 epochs) | the same test |
+| the walk and the link at 30,000 leaves | Export 6 microseconds, sealing one link 11 microseconds, opening one 1 microsecond, 72 bytes; at 4 and 1,024 leaves Export takes 3 and 6 microseconds and sealing 10 and 8 | a 30,000-leaf MLS group in one process, 8 epochs, a copy of kolo-mls's `TestMeasureKolo` that also exports and seals (not kept in this repository); the group itself costs 4 seconds an epoch at 30,000 leaves (Commit, settle and apply, under a load of 13), 170 ms at 1,024 |
+| 40 epochs at 3 devices | 39 messages read in 3.7 s (one message in each epoch, one segment of one entry in each) | `TestJoinerAtEpoch40ReadsEveryEpoch`, one run under a load of 13 |
+
+The cost of the links does not depend on the number of members, since a link holds one key; a year at 100 epochs a day is 36,500 links, 2.6 MB of data, 5.5 MB in memory and about 43 MB on disk at the numbers above. What `History` costs at 30,000 members is the segments, which are the same as for catch-up (see `SegmentEntries`).
+
+The walk writes the keys it derives with one write for each call of `History` that needs a key, so a joiner pays one write for each epoch it loads (4 ms on Pebble on the machine of the runs above, most of it the disk sync).
+
 ## Not built yet
 
-- **Cost of history keys** (planned, derived and not measured): about 120 bytes of data per epoch and about 600 bytes on disk per link.
 - **Wake-up of closed phones** (not built): it needs the mobile apps and a relay run by the app's owner.
 - **Published build** (blocked): `GOWORK=off` builds fail until kolo-mls and kolo-gossip have a release.
 - **Segment sizes at 30,000 members** (not measured): the runs above go to 64 devices.
 
 ## What the room can still lose
 
-A message is stored once a segment of an admin holds it, and its author keeps it until then (see `MaxReceipts`). It is lost only if its author loses the device before any admin stored it. A message that a device never received live is read from the segments, so a device that is behind loses nothing the admins stored. Reading a segment needs the key of its epoch, so a device does not read the segments of epochs before it joined (history for new members is planned). The tests wait for the mesh before they send the first message; later losses on the mesh are repaired by republishing.
+A message is stored once a segment of an admin holds it, and its author keeps it until then (see `MaxReceipts`). It is lost only if its author loses the device before any admin stored it. A message that a device never received live is read from the segments, so a device that is behind loses nothing the admins stored. Reading a segment needs the key of its epoch: a device reads the segments of epochs before it joined only with `History`, within the room's history rule. The tests wait for the mesh before they send the first message; later losses on the mesh are repaired by republishing.

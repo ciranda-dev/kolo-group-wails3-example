@@ -82,7 +82,7 @@ type Config struct {
 	Limits      Limits
 }
 
-// Policy is the room setting that a Commit changes; only the zero value is built.
+// Policy is the room setting that a Commit changes; only History and Since are built, and Create sets them.
 type Policy struct {
 	History  HistoryRule
 	Since    uint64              // with SinceEpoch
@@ -145,6 +145,7 @@ type Room struct {
 
 	kmu  sync.RWMutex
 	keys map[uint64][keySize]byte
+	lo   uint64 // the oldest epoch in keys, guarded by kmu
 
 	ever      map[[32]byte]*kologossip.Author // every author the room has had, guarded by kmu
 	joinEpoch uint64
@@ -185,6 +186,17 @@ type Room struct {
 	ctl   *roomLog
 	meta  meta
 
+	hmu    sync.Mutex           // guards links, past and pastBy
+	links  map[uint64][]linkRec // the history links of each epoch before the join, one for each admin
+	past   map[uint64][]*pastSeg
+	pastBy map[logKey]*pastSeg
+
+	histMu sync.Mutex // serializes History and guards what follows
+	hbound uint64     // the epochs from it up are loaded
+	hbuf   []Event    // loaded and not returned yet, oldest first
+	hlast  MessageID  // the oldest message of the last page
+	hseen  *idSet
+
 	ctlMu sync.Mutex // orders the appends to the control log
 	segMu sync.Mutex // guards seg and orders the appends to it
 	seg   *roomLog
@@ -224,7 +236,8 @@ func (n *Node) newRoom(ctx context.Context, name string, m *settle.Member, secre
 		out: newLimiter(n.limits.Rate*4/5, max(1, n.limits.Burst-1)), ord: newOrderer(n.cfg.Device.PublicKey(), n.limits), seen: newIDSet(n.limits.MaxKnown), events: make(chan Event, n.limits.EventQueue),
 		adminKick: make(chan struct{}, 1), syncKick: make(chan struct{}, 1), pushKick: make(chan struct{}, 1),
 		kv: newRoomKV(n.cfg.Backend, gid), logSec: sec, logs: map[logKey]*roomLog{}, dirs: map[[32]byte][]byte{}, rcpt: map[MessageID]*receipt{},
-		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, badCommits: map[[32]byte]struct{}{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, joinEpoch: v.epoch}
+		pinConns: map[string]*pinConn{}, promoting: map[[32]byte]chan *adminRequest{}, badCommits: map[[32]byte]struct{}{}, dirty: map[*roomLog]struct{}{}, ever: map[[32]byte]*kologossip.Author{}, joinEpoch: v.epoch,
+		links: map[uint64][]linkRec{}, past: map[uint64][]*pastSeg{}, pastBy: map[logKey]*pastSeg{}}
 	if mt != nil {
 		r.meta, r.joinEpoch = *mt, mt.JoinEpoch
 	} else {
@@ -294,6 +307,10 @@ func (r *Room) restore(v *view) error {
 		return err
 	}
 	r.keys[v.epoch] = v.key
+	r.lo = v.epoch
+	for e := range r.keys {
+		r.lo = min(r.lo, e)
+	}
 	if err := r.kv.put(v.key[:], recKey, epochKeyName(v.epoch)); err != nil {
 		return err
 	}
@@ -352,6 +369,11 @@ func (r *Room) reopenLogs() error {
 	for _, x := range recs {
 		var l *roomLog
 		var err error
+		if !x.r.Ctl && !x.r.Own && x.r.Epoch < r.joinEpoch {
+			r.n.cfg.Store.Delete(x.id)
+			r.kv.del(recLog, x.owner[:], x.id[:])
+			continue
+		}
 		if x.r.Own {
 			if l, err = r.openLog(x.r.Ctl, x.r.Epoch, &x.id); err == nil {
 				r.logMu.Lock()
@@ -629,11 +651,6 @@ func (r *Room) emit(evs ...Event) {
 	r.release(func() []Event { return evs })
 }
 
-// History returns up to n events that come before the given message.
-func (r *Room) History(ctx context.Context, before MessageID, n int) ([]Event, error) {
-	return nil, ErrNotImplemented
-}
-
 // Members lists the devices of the room's current epoch, in the order of the tree.
 func (r *Room) Members() []Member {
 	v := r.view.Load()
@@ -825,8 +842,14 @@ func (r *Room) refreshLocked() []Event {
 	if err := errors.Join(r.kv.put(v.key[:], recKey, epochKeyName(v.epoch)), r.rememberAuthors(v)); err != nil {
 		return []Event{{Kind: MembersChanged, Err: err}}
 	}
+	// The link goes to the log before the view changes, so no segment of the new epoch comes before it.
+	linkErr := r.writeLink(v)
 	r.view.Store(v)
 	r.notify()
 	r.n.refreshMembers()
-	return []Event{{Kind: MembersChanged, Epoch: v.epoch}}
+	evs := []Event{{Kind: MembersChanged, Epoch: v.epoch}}
+	if linkErr != nil {
+		evs = append(evs, Event{Kind: MembersChanged, Epoch: v.epoch, Err: fmt.Errorf("room: writing the history link of epoch %d: %w", v.epoch, linkErr)})
+	}
+	return evs
 }

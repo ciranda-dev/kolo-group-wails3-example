@@ -25,7 +25,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Protective bounds in `room.Limits` with their basis in `docs/limits.md`: `SegmentEntries`, `KeepSegments`, `MaxLogs`, `PinGap`, `PinTTL`, `PinWait`, `CatchUpWait`, `RepublishAfter` and `MaxReceipts`.
 - Tests: segments, catch-up, restart and pins at 3 and 4 devices, a run of 16 and one of 64 devices with 2 admins, 2 pins, an admin killed in the middle of an epoch and 10,000 messages over three epochs, hostile segments (a bad signature, a key that does not open, an unknown author, a gap, a rewritten history, a bad SettledCommit), the decoders and their fuzz tests.
 
+- History for new members in `internal/room`: an admin writes, for each epoch it enters, a history link (the key of the epoch before, sealed under the key of the epoch) to its control log, and `Room.History` reads the messages of the epochs before the join, backward, through the chain of links and the admins' segments (from the admins, the members or the pins). A message that cannot be read is reported with `ErrCatchUp` and its cause, a chain that cannot go on with `ErrHistory`, a refused link with `ErrLink`.
+- The history rule (`AllHistory`, the default, `SinceEpoch` or `NoHistory`) is chosen in `Create` and recorded in a GroupContext extension (0xF003) that the settled Commits sign and the Welcomes carry. No link is written for an epoch the rule leaves out, a link written after a segment of its epoch is refused, and a rule is never retroactive.
+- Tests: a joiner of epoch 40 reads epochs 1 to 39, `SinceEpoch`, `NoHistory`, a member removed at epoch 20, late, out-of-policy, forged and missing links, undecryptable entries, a message of a device that left before the join, a restart, the pins, and fuzz tests of the new decoders. `docs/security.md` states the cost in forward secrecy and `docs/limits.md` the measured cost of the links.
+
 ### Changed
+
+- `Create` accepts `Policy.History` and `Policy.Since`; it still refuses posters and a read link. A key package lists the policy extension among its capabilities.
+- A message sealed in an epoch before the join never shows in `Next`, even when an admin stored it in a later segment: it belongs to `History`.
 
 - A sealed message carries the signature of its author, and the id of a message is a hash of what the author signed, the same for every holder of a copy (it was gossip's id). The id of a message sent by an older build differs.
 - A device publishes at most four fifths of `Rate`, waiting for the rest, and a message whose time is older than its envelope's is accepted (`MaxSkew` bounds only a time ahead).

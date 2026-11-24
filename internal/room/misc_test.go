@@ -65,7 +65,7 @@ func TestOperationsRefuseWhatTheyCannotDo(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 20*time.Second, "the message", func() bool { return gr.recs[2].has("still works") })
-	if _, err := gr.nodes[0].n.Create(ctx, "x", Policy{History: NoHistory}); !errors.Is(err, ErrNotImplemented) {
+	if _, err := gr.nodes[0].n.Create(ctx, "x", Policy{ReadLink: true}); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("Create with a policy that is not built: %v", err)
 	}
 	if _, err := gr.nodes[0].n.Create(ctx, string(make([]byte, maxName+1)), Policy{}); !errors.Is(err, ErrInvalid) {
@@ -90,9 +90,6 @@ func TestOperationsRefuseWhatTheyCannotDo(t *testing.T) {
 	}
 	if _, err := a.Link(); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("Link: %v", err)
-	}
-	if _, err := a.History(ctx, MessageID{}, 1); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("History: %v", err)
 	}
 	if _, err := gr.nodes[0].n.JoinLink(ctx, nil); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("JoinLink: %v", err)

@@ -274,13 +274,17 @@ func (n *Node) KeyPackage() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return kolomls.NewKeyPackage(n.cfg.MLSStore, kolomls.KeyPackageOptions{Credential: c, SignatureKey: sig, Capabilities: settle.Capabilities()})
+	caps := settle.Capabilities()
+	caps.Extensions = append(caps.Extensions, policyExtension)
+	return kolomls.NewKeyPackage(n.cfg.MLSStore, kolomls.KeyPackageOptions{Credential: c, SignatureKey: sig, Capabilities: caps})
 }
 
-// Create makes a room with this device as its first member, admin and settler.
+// Create makes a room with this device as its first member, admin and settler. The history rule of p is recorded in the
+// room's GroupContext; the posters and the read link are not built.
 func (n *Node) Create(ctx context.Context, name string, p Policy) (*Room, error) {
-	if p.History != AllHistory || p.Since != 0 || len(p.Posters) != 0 || p.ReadLink {
-		return nil, ErrNotImplemented
+	hp, err := p.validate()
+	if err != nil {
+		return nil, err
 	}
 	if len(name) > maxName {
 		return nil, errInvalid("a name of %d bytes", len(name))
@@ -303,7 +307,7 @@ func (n *Node) Create(ctx context.Context, name string, p Policy) (*Room, error)
 	if err != nil {
 		return fail(err)
 	}
-	exts, err := settle.GroupExtensions(roles)
+	exts, err := groupExtensions(roles, hp)
 	if err != nil {
 		return fail(err)
 	}

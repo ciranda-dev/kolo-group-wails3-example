@@ -3,6 +3,7 @@ package room
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -162,4 +163,70 @@ func TestMeasureOpenLogs(t *testing.T) {
 	}
 	t.Logf("%d open logs of one entry: %d B each", n, (int64(heapInUse())-int64(before))/n)
 	s.Close()
+}
+
+// TestMeasureLinks measures what the history links cost: the bytes of a link on disk, and the time and memory of walking back
+// n epochs, at 3 members. It runs with KOLO_GROUP_MEASURE=1.
+func TestMeasureLinks(t *testing.T) {
+	if os.Getenv("KOLO_GROUP_MEASURE") == "" {
+		t.Skip("measurement: set KOLO_GROUP_MEASURE=1")
+	}
+	ctx := context.Background()
+	var secret kololog.EntrySecret
+	secret[0] = 1
+	rec := (&ctlRecord{Kind: ctlLink, Epoch: 1 << 20, Value: make([]byte, linkSize)}).encode()
+	for _, n := range []int{1000, 10000} {
+		dir := filepath.Join(t.TempDir(), "w")
+		b, err := kolostore.OpenPebble(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := kolostore.New(b)
+		l, err := s.Create(ident(t), kololog.WithDerivedKeys(&secret, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range n {
+			if _, err := l.Append(rec); err != nil {
+				t.Fatal(err)
+			}
+		}
+		l.Close()
+		s.Close()
+		t.Logf("%d links: a record is %d B, %d B on disk for each", n, len(rec), dirSize(dir)/int64(n))
+	}
+	gr := newGroupWith(t, 3, Limits{CatchUpWait: time.Second}, func(o *tnodeOpts) { o.dir = t.TempDir() })
+	r := gr.rooms[0]
+	for _, n := range []uint64{1000, 10000, 100000} {
+		keys := make([][keySize]byte, n+1)
+		for i := range keys {
+			rand.Read(keys[i][:])
+		}
+		links := map[uint64][]linkRec{}
+		before := heapInUse()
+		for e := uint64(1); e <= n; e++ {
+			l, err := sealLink(r.gid[:], e, &keys[e], &keys[e-1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			links[e] = []linkRec{{owner: [32]byte{1}, link: [linkSize]byte(l)}}
+		}
+		held := int64(heapInUse()) - int64(before)
+		r.hmu.Lock()
+		r.links = links
+		r.hmu.Unlock()
+		r.kmu.Lock()
+		clear(r.keys)
+		r.keys[n], r.lo = keys[n], n
+		r.kmu.Unlock()
+		start := time.Now()
+		if err := r.deriveBack(ctx, 0); err != nil {
+			t.Fatal(err)
+		}
+		d := time.Since(start)
+		if r.keys[0] != keys[0] {
+			t.Fatal("the walk did not reach the first key")
+		}
+		t.Logf("walk of %d links on Pebble: %v (%v each), %d B of memory for the links held, %d B each", n, d.Round(time.Millisecond), (d / time.Duration(n)).Round(time.Microsecond), held, held/int64(n))
+	}
 }

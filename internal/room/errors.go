@@ -23,6 +23,8 @@ var (
 	ErrBadTime         = errors.New("room: message time out of range")
 	ErrSignature       = errors.New("room: author signature does not verify")
 	ErrCatchUp         = errors.New("room: stored message not read")
+	ErrHistory         = errors.New("room: history not readable")
+	ErrLink            = errors.New("room: history link refused")
 	ErrTooManyLogs     = errors.New("room: too many logs followed")
 	ErrTooManyReceipts = errors.New("room: too many messages not stored yet")
 )
