@@ -78,8 +78,11 @@ type Config struct {
 	// BraidLimits are the local bounds of the admins' braid; nil takes kolo-braid's defaults.
 	BraidLimits *kolobraid.Limits
 	Pins        []pin.Peer
-	Now         func() time.Time
-	Limits      Limits
+	// ServeTree makes a member that is no admin keep and serve the tree logs of joiners, as the admins and the pins do; it
+	// pulls the tree of every Add (14.5 MB at 30,000 leaves) and sends it to each joiner that asks. Off by default.
+	ServeTree bool
+	Now       func() time.Time
+	Limits    Limits
 }
 
 // Policy is the room setting that a Commit changes: who may read the history, who may post and whether the room has a read
@@ -412,7 +415,7 @@ func (r *Room) reopenLogs() error {
 	for _, x := range recs {
 		var l *roomLog
 		var err error
-		if !x.r.Ctl && !x.r.Own && (x.r.Epoch < r.joinEpoch || x.r.Tree && x.r.Epoch < r.view.Load().epoch) {
+		if !x.r.Ctl && !x.r.Own && (x.r.Epoch < r.joinEpoch || x.r.Tree && (x.r.Epoch < r.view.Load().epoch || !r.servesTree())) {
 			r.n.cfg.Store.Delete(x.id)
 			r.kv.del(recLog, x.owner[:], x.id[:])
 			continue

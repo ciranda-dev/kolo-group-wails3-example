@@ -662,10 +662,15 @@ func (r *Room) dropTreeLog(epoch uint64) {
 	}
 }
 
-// followTree replicates the log of the sealed tree that an admin named, unless the room is past its epoch: only a joiner of
-// that epoch reads it, and a device that holds it can serve it.
+// servesTree reports whether this device keeps the tree logs of joiners: an admin does, a member only by Config.ServeTree.
+func (r *Room) servesTree() bool {
+	return !r.reader && (r.n.cfg.ServeTree || r.view.Load().roles.Admin(r.self))
+}
+
+// followTree replicates the log of the sealed tree that an admin named, if this device serves trees and the room is not
+// past its epoch: only a joiner of that epoch reads it.
 func (r *Room) followTree(l *roomLog, rec *ctlRecord) {
-	if rec.Epoch < r.view.Load().epoch {
+	if rec.Epoch < r.view.Load().epoch || !r.servesTree() {
 		return
 	}
 	hd, err := kololog.DecodeLogHeader(rec.Header)
