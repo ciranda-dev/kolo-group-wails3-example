@@ -4,6 +4,7 @@ import (
 	"time"
 
 	kolomls "github.com/ciranda-dev/kolo-mls"
+	kolosync "github.com/ciranda-dev/kolo-sync"
 )
 
 // Limits holds the configurable protective bounds of a node; a zero field takes its default, and a negative one is refused.
@@ -22,14 +23,17 @@ type Limits struct {
 	MaxTreeBytes   int           // largest ratchet tree a join accepts
 
 	SegmentEntries int           // entries a segment log holds before the next one opens
-	KeepSegments   int           // closed segments a device keeps and serves for each room
-	MaxLogs        int           // logs a room follows: the control logs and segments of its admins
+	KeepSegments   int           // closed segments a device keeps and serves for each room, and apart from them control logs it has left
+	MaxLogs        int           // replicas a room follows of its admins' logs; the device's own logs do not count
 	PinGap         time.Duration // least time between two pushes of a log to the pins
 	PinTTL         time.Duration // how long a capability for the pins lasts
 	PinWait        time.Duration // how long a device that is not caught up waits for its peers before it asks the pins
 	CatchUpWait    time.Duration // how long a closed segment may stay incomplete before the room reports it
 	RepublishAfter time.Duration // how long a message may stay unstored before its author publishes it again
 	MaxReceipts    int           // messages sent and not yet stored; a Send past it fails
+
+	PeerBytesPerSecond int64 // bytes of logs each peer may pull from this node each second, over all its rooms
+	PeerBurstBytes     int64 // bytes a peer may pull at once; at least twice kolo-sync's MaxMessageSize
 }
 
 const (
@@ -57,7 +61,7 @@ func (l Limits) withDefaults() (Limits, error) {
 	if l.MaxMessageSize < 0 || l.Rate < 0 || l.Burst < 0 || l.MaxParents < 0 || l.ParentHold < 0 || l.MaxHeld < 0 ||
 		l.MaxKnown < 0 || l.EventQueue < 0 || l.PastEpoch < 0 || l.MaxSkew < 0 || l.MaxTreeBytes < 0 ||
 		l.SegmentEntries < 0 || l.KeepSegments < 0 || l.MaxLogs < 0 || l.PinGap < 0 || l.PinTTL < 0 || l.PinWait < 0 || l.CatchUpWait < 0 ||
-		l.RepublishAfter < 0 || l.MaxReceipts < 0 {
+		l.RepublishAfter < 0 || l.MaxReceipts < 0 || l.PeerBytesPerSecond < 0 || l.PeerBurstBytes < 0 {
 		return l, errInvalid("a negative limit")
 	}
 	if l.MaxMessageSize == 0 {
@@ -92,6 +96,12 @@ func (l Limits) withDefaults() (Limits, error) {
 	}
 	if l.MaxTreeBytes == 0 {
 		l.MaxTreeBytes = kolomls.DefaultMaxTreeBytes
+	}
+	if l.PeerBytesPerSecond == 0 {
+		l.PeerBytesPerSecond = kolosync.DefaultPeerBytesPerSecond
+	}
+	if l.PeerBurstBytes == 0 {
+		l.PeerBurstBytes = kolosync.DefaultPeerBurstBytes
 	}
 	for _, d := range []struct {
 		v   *int

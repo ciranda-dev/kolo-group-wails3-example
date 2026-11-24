@@ -206,7 +206,7 @@ type Room struct {
 	pastBy   map[logKey]*pastSeg
 	prevs    []prevLog         // the control logs that came before the ones followed
 	early    map[logKey]uint64 // the final sizes of segments closed before a log that opened them was read
-	wantPast atomic.Bool       // History has asked for the epochs before the join
+	needPast atomic.Uint64     // one past the epoch History is loading, 0 before it loads one
 
 	histMu   sync.Mutex // serializes History and guards what follows
 	hbound   uint64     // the epochs from it up are loaded
@@ -339,7 +339,7 @@ func (n *Node) assemble(ctx context.Context, name string, gid GroupID, m *settle
 func (n *Node) joinTopic(ctx context.Context, t kologossip.Topic, o *kologossip.TopicOptions) (*kologossip.Room, error) {
 	wait := 50 * time.Millisecond
 	for {
-		gr, err := n.cfg.Gossip.Join(ctx, t, o)
+		gr, err := gossipJoin(n.cfg.Gossip, ctx, t, o)
 		if !errors.Is(err, kolodht.ErrNoNodes) {
 			return gr, err
 		}
@@ -351,6 +351,9 @@ func (n *Node) joinTopic(ctx context.Context, t kologossip.Topic, o *kologossip.
 		wait = min(2*wait, n.limits.PinWait)
 	}
 }
+
+// gossipJoin is Gossip.Join, which a test slows down.
+var gossipJoin = (*kologossip.Gossip).Join
 
 // allowPeer admits to the room's topic the devices of its current epoch, and of the previous one while its window lasts;
 // a room with a read link, or read with one, admits any device. A node that admits any device to its connections, for a
